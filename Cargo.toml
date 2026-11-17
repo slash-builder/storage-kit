@@ -1,0 +1,63 @@
+[package]
+name = "slashbuilder-storage-kit"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Content-addressed binary storage engine for the SlashBuilder Kit ecosystem: BLAKE3 addressing, recursive fragmentation, Zstd packfiles, per-partition dedup, and async local, S3 and HTTP backends"
+repository = "https://github.com/slash-builder/storage-kit"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["content-addressed", "storage", "blake3", "deduplication", "s3"]
+categories = ["filesystem", "data-structures"]
+# An allow-list, not an exclude: nothing but the library source, the docs and the licence can ship by accident.
+include = ["/src/", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+# The library keeps the short name `storage_kit` so `use storage_kit::...` is unchanged for every Kit and product that
+# imports it (bitchain, for one); only the published package name carries the `slashbuilder-` prefix.
+[lib]
+name = "storage_kit"
+path = "src/lib.rs"
+
+[dependencies]
+# The content-addressing, fragmentation and packfile engine. This crate does not depend on bitchain; bitchain depends on
+# this crate.
+blake3 = "1"
+fastcdc = "3"
+zstd = "0.13"
+memmap2 = "0.9"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "fs", "sync"] }
+async-trait = "0.1"
+thiserror = "1.0"
+# `partition.json`'s `created_at`: an RFC 3339 UTC timestamp. Only `clock` is enabled; the field is stored as a `String`,
+# not as `chrono::DateTime`, so the `serde` feature is not needed.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Cloud transport backends are feature-gated. `default = ["s3", "http"]` below keeps existing consumers unaffected; a
+# local-only consumer sets `default-features = false` to link neither cloud transport, which pulls in no
+# aws-sdk-s3/aws-config/reqwest/hyper at all. `bytes` is only used by `S3Backend`, so it rides the `s3` feature.
+# aws-sdk-s3 with its default features off. The defaults add a legacy connector (hyper 0.14 / rustls 0.21 / h2 0.3) that
+# carries open RustSec advisories and is not the connector `aws-config` selects, and `sigv4a` (multi-region access point
+# signing, which this crate does not use) pulls in vulnerable `crypto-bigint` versions under the MSRV-pinned lockfile.
+# `default-https-client` is the rustls 0.23 client `aws-config` also uses.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "http-1x"], optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false, optional = true }
+bytes = { version = "1", optional = true }
+
+[features]
+default = ["s3", "http"]
+# S3 / S3-compatible (Wasabi, B2, R2, MinIO) transport backend.
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:bytes"]
+# HTTP(S) transport backend (talks to a Refraction server or similar).
+http = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+pretty_assertions = "1.4"
+# The conformance suite in tests/conformance.rs imports the frozen `conformance::{Case, run_suite}` harness from
+# `slashbuilder-spec-kit` on crates.io; the library is still imported as `spec_kit`.
+slashbuilder-spec-kit = "0.1"
