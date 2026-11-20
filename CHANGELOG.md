@@ -8,7 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] - first release on crates.io
+## [0.2.0] - 2026-11-17
 
 This is the first version published on crates.io, under the package name
 **`slashbuilder-storage-kit`**. The library name is unchanged: you still write
