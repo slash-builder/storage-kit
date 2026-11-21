@@ -30,7 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "fs", "sync"] }
 async-trait = "0.1"
-thiserror = "1.0"
+thiserror = "2.0"
 # `partition.json`'s `created_at`: an RFC 3339 UTC timestamp. Only `clock` is enabled; the field is stored as a `String`,
 # not as `chrono::DateTime`, so the `serde` feature is not needed.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
