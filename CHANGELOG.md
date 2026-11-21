@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/slash-builder/storage-kit/compare/v0.2.0...v0.2.1) - 2026-11-21
+
+### Other
+
+- date the 0.2.0 changelog heading ([#8](https://github.com/slash-builder/storage-kit/pull/8))
+- *(deps)* Bump zstd from 0.13.5 to 0.14.4 ([#4](https://github.com/slash-builder/storage-kit/pull/4))
+
 ## [0.2.0] - 2026-11-17
 
 This is the first version published on crates.io, under the package name
