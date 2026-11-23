@@ -2,7 +2,7 @@
 name = "slashbuilder-storage-kit"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "Content-addressed binary storage engine for the SlashBuilder Kit ecosystem: BLAKE3 addressing, recursive fragmentation, Zstd packfiles, per-partition dedup, and async local, S3 and HTTP backends"
 repository = "https://github.com/slash-builder/storage-kit"
 license = "Apache-2.0"
