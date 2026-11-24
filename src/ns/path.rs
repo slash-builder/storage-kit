@@ -11,15 +11,26 @@
 //! - is empty, `.` or `..`;
 //! - is not already in Unicode **NFC** (the namespace never normalises, because normalising silently changes which
 //!   entry a caller addressed);
-//! - contains a control character (`char::is_control`, so C0, DEL and C1), `\`, `:` or any of `<>"|?*`;
+//! - contains a control character (`char::is_control`, so C0, DEL and C1), a **format character** from the fixed list
+//!   in [`is_format_character`] (bidirectional controls, zero-width spaces, the soft hyphen, the byte-order mark: all
+//!   invisible or reordering characters), `\`, `:` or any of `<>"|?*`;
 //! - ends in a dot or a space (Windows strips them, so the name would not round-trip);
 //! - is a Windows reserved device name (`CON PRN AUX NUL COM1-9 LPT1-9`, plus `CONIN$`, `CONOUT$` and the superscript
 //!   digit forms), case-insensitively, with or without an extension (`con.txt` is as reserved as `CON`);
 //! - is longer than [`MAX_NAME_BYTES`] (255) UTF-8 bytes, or the whole path is longer than [`MAX_PATH_BYTES`] (4096);
-//! - begins with [`TEMP_PREFIX`], which `HostDir` reserves for its atomic-replace temporary files.
+//! - begins with [`TEMP_PREFIX`] (compared case-folded, so `.SKNS-TMP-` on a case-insensitive volume is refused too),
+//!   which `HostDir` reserves for its atomic-replace temporary files.
 //!
-//! Two names that differ only by case are **distinct paths** but cannot *coexist* in one directory: creating the second
-//! is refused with `CaseCollision` (see [`case_fold_key`]), on every backend, even a case-sensitive one.
+//! Why the format characters: a name is something a person reads (a confirmation diff of a launcher entry, a file
+//! manager, a log line). A name that can *display* as something other than what it *is* (a right-to-left override that
+//! reverses `txt.exe` into `exe.txt`, a zero-width space that makes two different names look identical) lets one entry
+//! impersonate another in front of the person deciding. The list is fixed, not a Unicode category lookup, so a Unicode
+//! update cannot silently change which names are legal. Zero-width joiner (U+200D) and non-joiner (U+200C) stay legal:
+//! scripts such as Persian, Devanagari and emoji sequences need them.
+//!
+//! Two names that differ only by case (or only by Unicode normalisation form) are **distinct paths** but cannot
+//! *coexist* in one directory: creating the second is refused with `CaseCollision` (see [`case_fold_key`]), on every
+//! backend, even a case-sensitive one.
 
 use std::fmt;
 use std::str::FromStr;
@@ -57,6 +68,8 @@ pub enum PathReason {
     DotDotComponent,
     /// A control character (C0, DEL or C1).
     ControlCharacter,
+    /// An invisible or direction-changing format character (see [`is_format_character`]).
+    FormatCharacter,
     /// One of `\ : < > " | ? *`.
     ForbiddenCharacter,
     /// The name is not in Unicode NFC. Normalise it before asking.
@@ -85,6 +98,9 @@ impl PathReason {
                 "a '..' component (there is no parent traversal; give the parent's path)"
             }
             PathReason::ControlCharacter => "a control character in a name",
+            PathReason::FormatCharacter => {
+                "an invisible or direction-changing format character in a name (bidi control, zero-width space, soft hyphen, BOM)"
+            }
             PathReason::ForbiddenCharacter => {
                 "a character that is not portable in a name (one of \\ : < > \" | ? *)"
             }
@@ -248,6 +264,25 @@ impl NsPath {
         })
     }
 
+    /// The components as case-fold keys: how mounts are matched (a mount at `/Config` also answers to `/config`).
+    pub(crate) fn fold_components(&self) -> Vec<String> {
+        self.components().map(case_fold_key).collect()
+    }
+
+    /// The path made of this path's components after the first `skip`, re-rooted at `/`.
+    pub(crate) fn tail_after(&self, skip: usize) -> NsPath {
+        let mut out = String::new();
+        for c in self.components().skip(skip) {
+            out.push('/');
+            out.push_str(c);
+        }
+        if out.is_empty() {
+            NsPath::root()
+        } else {
+            NsPath(out)
+        }
+    }
+
     /// The inverse of [`NsPath::strip_prefix`]: place this (mount-relative, `/`-rooted) path under `base`.
     pub fn rebase(&self, base: &NsPath) -> Result<NsPath, NsError> {
         if base.is_root() {
@@ -320,6 +355,9 @@ pub fn validate_name(name: &str) -> Result<(), PathReason> {
         if c.is_control() {
             return Err(PathReason::ControlCharacter);
         }
+        if is_format_character(c) {
+            return Err(PathReason::FormatCharacter);
+        }
         if FORBIDDEN.contains(&c) {
             return Err(PathReason::ForbiddenCharacter);
         }
@@ -333,10 +371,32 @@ pub fn validate_name(name: &str) -> Result<(), PathReason> {
     if is_reserved_device_name(name) {
         return Err(PathReason::ReservedName);
     }
-    if name.starts_with(TEMP_PREFIX) {
+    // Folded, so `.SKNS-TMP-1` is refused too: on a case-insensitive volume it IS a temporary file.
+    if case_fold_key(name).starts_with(TEMP_PREFIX) {
         return Err(PathReason::ReservedPrefix);
     }
     Ok(())
+}
+
+/// The characters the grammar refuses as *format characters*: a fixed list, deliberately not a Unicode category.
+///
+/// U+00AD soft hyphen; U+061C Arabic letter mark; U+180E Mongolian vowel separator; U+200B zero-width space;
+/// U+200E and U+200F left-to-right and right-to-left marks; U+202A to U+202E bidirectional embeddings and overrides;
+/// U+2060 to U+2064 word joiner and invisible operators; U+2066 to U+2069 bidirectional isolates; U+FEFF byte-order mark.
+/// U+200C (zero-width non-joiner) and U+200D (zero-width joiner) are **not** on the list.
+pub fn is_format_character(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Windows treats the part of a name before its first dot as the device name, ignoring trailing spaces in that part.
@@ -369,13 +429,18 @@ fn is_reserved_device_name(name: &str) -> bool {
     }
 }
 
-/// The key under which two names count as "the same name differing only by case".
+/// The key under which two names count as "the same name differing only by case or normalisation form".
 ///
-/// An approximation of full Unicode case folding (upper-case then lower-case, so `ß` meets `SS`). It is intentionally a
-/// bit **stricter** than most volumes: a false collision costs a caller a rename, a missed one costs a file silently
-/// overwriting another on macOS or Windows. It does not model locale rules (Turkish dotless i).
+/// `NFC(lowercase(uppercase(NFC(name))))`: an approximation of full Unicode case folding (so `ß` meets `SS`), then
+/// normalised again because case mapping can denormalise. Two consequences matter. It is intentionally a bit
+/// **stricter** than most volumes: a false collision costs a caller a rename, a missed one costs a file silently
+/// overwriting another on macOS or Windows. And an NFD-spelled name that already exists on disk (APFS and HFS+ keep
+/// whatever form they were given, and treat the forms as the same name) has the same key as its NFC twin, so the twin
+/// cannot be created over it. It does not model locale rules (Turkish dotless i).
 pub fn case_fold_key(name: &str) -> String {
-    name.to_uppercase().to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    let composed: String = name.nfc().collect();
+    composed.to_uppercase().to_lowercase().nfc().collect()
 }
 
 #[cfg(test)]

@@ -16,10 +16,17 @@
 //! - **Only regular files and directories are ever opened.** A FIFO, socket or device is classified with `lstat`
 //!   first and never opened (opening a FIFO can block forever); the open itself is also non-blocking, and the opened
 //!   handle's `fstat` is checked again. A hostile swap to a FIFO between the two steps cannot hang a read.
-//! - **A write to a file with more than one hard link is refused** (`HardLinked`), as is a `Replace` of one.
+//! - **A write to a file with more than one hard link is refused** (`HardLinked`), as is a `Replace` of one. Today
+//!   this is a *belt*: `Replace` renames a new file over the name, so another name for the same inode keeps the old
+//!   content either way. The guard is kept for the day an in-place write (`append`, `at_offset`) exists, when it
+//!   becomes the thing that stops a write through one name from changing a file reachable by another.
 //! - **Names are checked against the portable grammar** and creating a name that case-folds to an existing sibling is
-//!   refused (`CaseCollision`) even on a case-sensitive volume. Entries whose names are outside the grammar are not
-//!   listed, so they cannot be named.
+//!   refused (`CaseCollision`) even on a case-sensitive volume. The decision is made on a **listing of the directory**,
+//!   comparing the names as stored: an exact match is `AlreadyExists`, a match that differs only by case or by Unicode
+//!   normalisation form is `CaseCollision`. `lstat` is never used for it, because on a case-insensitive volume (the
+//!   macOS and Windows default) `lstat` answers "exists" to any spelling. Costs one directory listing per create,
+//!   replace and rename. A rename that only respells its own entry (`a` to `A`) is allowed; a rename onto itself is not.
+//!   Entries whose names are outside the grammar are not listed, so they cannot be named.
 //! - Files are created `0600` and directories `0700`.
 //!
 //! # What it does not guarantee (read before relying on it)
@@ -35,10 +42,18 @@
 //!   replaces a destination that appeared in the window.
 //! - **Rights of whoever else can write the directory.** A process that can already write inside the root can cause
 //!   `Io` errors and denial of service (for example by filling the disk), and can race the best-effort checks above.
-//!   It cannot make the namespace read or write outside the root.
+//!   It cannot make the namespace read or write outside the root. It *can* (it is the same user, or has write access)
+//!   rename or replace a directory, including one the Kit holds a handle to or one a mount point hangs from, so what a
+//!   path names can change between two calls, and a rename of the mount's own root directory by someone outside the
+//!   Kit leaves the held handle pointing at the moved directory. That gives them nothing they did not already have, but
+//!   the Kit does not defend against it: confinement is "never outside the handle it holds", not "the directory stays
+//!   where it was".
 //! - **Polling watch** sees a change only on the poll after it happens, and fingerprints `(name, kind, len, mtime,
 //!   inode)`: two in-place writes of the same length inside one filesystem timestamp tick can be missed. A watched
-//!   tree is held in memory; a recursive watch of a huge tree costs memory proportional to it.
+//!   tree is held in memory, bounded by [`WatchOpts::max_tracked`](super::WatchOpts::max_tracked) (a bigger tree is
+//!   refused at the start, and degrades to a single `rescan` if it grows past it). A recursive scan keeps directory
+//!   *paths* and opens one directory at a time, so it holds a handful of file descriptors however wide the tree is; a
+//!   scan that cannot finish (descriptors, I/O error) is reported as one `rescan`, not compared as a partial picture.
 //! - **Hard-link and alias writes through other names** are only caught by the link count at the moment of the call.
 //!
 //! ## Windows is the weakest platform, and says so
@@ -70,9 +85,9 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirBuilder, File, Metadata, OpenOptions};
 
 use super::backend::{Backend, Caps, Entry, Kind, Stat, Version, WatchKind, WriteOp};
-use super::error::{NsError, NsErrorKind, NsResult};
+use super::error::{InputReason, NsError, NsErrorKind, NsResult};
 use super::path::{case_fold_key, validate_name, NsPath, TEMP_PREFIX};
-use super::watch::{spawn_poller, Fingerprint, Snapshot, Watch, WatchOpts};
+use super::watch::{spawn_poller, Fingerprint, ScanOutcome, Snapshot, Watch, WatchOpts};
 
 #[cfg(unix)]
 use cap_std::fs::{DirBuilderExt, OpenOptionsExt};
@@ -337,14 +352,9 @@ fn open_dir_at(root: &Dir, path: &NsPath) -> NsResult<Dir> {
 
 /// The parent directory handle and final name of `path`. The root has no parent: callers handle it first.
 fn open_parent<'p>(root: &Dir, path: &'p NsPath) -> NsResult<(Dir, &'p str)> {
-    let name = path.file_name().ok_or_else(|| {
-        NsError::at(
-            NsErrorKind::InvalidInput(
-                "the mount root has no parent and cannot be the target of this operation",
-            ),
-            path,
-        )
-    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| NsError::at(NsErrorKind::InvalidInput(InputReason::MountRoot), path))?;
     let parent = path.parent().unwrap_or_else(NsPath::root);
     Ok((open_dir_at(root, &parent)?, name))
 }
@@ -461,7 +471,7 @@ fn no_data(data: &[u8], path: &NsPath) -> NsResult<()> {
         Ok(())
     } else {
         Err(NsError::at(
-            NsErrorKind::InvalidInput("this operation takes no data"),
+            NsErrorKind::InvalidInput(InputReason::UnexpectedData),
             path,
         ))
     }
@@ -472,7 +482,7 @@ fn no_version(if_version: Option<&Version>, path: &NsPath) -> NsResult<()> {
         Ok(())
     } else {
         Err(NsError::at(
-            NsErrorKind::InvalidInput("if_version is meaningless for an operation that creates"),
+            NsErrorKind::InvalidInput(InputReason::VersionOnCreate),
             path,
         ))
     }
@@ -485,37 +495,59 @@ fn no_version(if_version: Option<&Version>, path: &NsPath) -> NsResult<()> {
 enum Conflict {
     /// A sibling with exactly this name.
     Same,
-    /// A sibling that differs only by case.
+    /// A sibling that differs only by case or normalisation form.
     Fold,
 }
 
-/// Look through `dir` for a sibling that is, or case-folds to, `name`. `ignore` is the entry being renamed.
-fn find_conflict(
-    dir: &Dir,
-    name: &str,
-    ignore: Option<&str>,
-    path: &NsPath,
-) -> NsResult<Option<Conflict>> {
-    let key = case_fold_key(name);
+/// The names in `dir`, as UTF-8 (a name that is not UTF-8 cannot collide with a namespace name). Every kind of entry
+/// counts, symlinks and FIFOs included: they occupy the name.
+///
+/// The collision decision is made on this listing and nowhere else. `lstat` is not used for it: on a case-insensitive
+/// volume (the default on macOS and Windows) it answers "exists" for a differently-cased spelling, which would turn a
+/// `CaseCollision` into an `AlreadyExists`. The listing carries the names as stored, so exact equality and
+/// case-fold equality can be told apart on every platform.
+fn list_names(dir: &Dir, path: &NsPath) -> NsResult<Vec<String>> {
     let entries = dir.entries().map_err(|e| NsError::from_io(&e, path))?;
-    let mut fold = false;
+    let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| NsError::from_io(&e, path))?;
-        let existing = entry.file_name();
-        let Some(existing) = existing.to_str() else {
-            continue;
-        };
-        if Some(existing) == ignore {
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Look through `names` for a sibling that is, or folds to, `name`. `ignore` is the stored name of the entry being
+/// renamed (it does not conflict with itself).
+fn conflict_in(names: &[String], name: &str, ignore: Option<&str>) -> Option<Conflict> {
+    let key = case_fold_key(name);
+    let mut fold = false;
+    for existing in names {
+        if Some(existing.as_str()) == ignore {
             continue;
         }
         if existing == name {
-            return Ok(Some(Conflict::Same));
+            return Some(Conflict::Same);
         }
         if case_fold_key(existing) == key {
             fold = true;
         }
     }
-    Ok(fold.then_some(Conflict::Fold))
+    fold.then_some(Conflict::Fold)
+}
+
+/// The stored name of the entry that `name` refers to: the exact match if there is one, otherwise the single entry
+/// with the same fold key (a case-insensitive volume answering to a different spelling).
+fn stored_name<'a>(names: &'a [String], name: &str) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|n| n.as_str() == name)
+        .or_else(|| {
+            let key = case_fold_key(name);
+            names.iter().find(|n| case_fold_key(n) == key)
+        })
+        .map(String::as_str)
 }
 
 fn conflict_error(c: Conflict, path: &NsPath) -> NsError {
@@ -590,11 +622,12 @@ impl HostDir {
     ) -> NsResult<Version> {
         no_version(if_version, path)?;
         let (parent, name) = open_parent(&self.root, path)?;
+        if let Some(c) = conflict_in(&list_names(&parent, path)?, name, None) {
+            return Err(conflict_error(c, path));
+        }
+        // Not in the listing but present anyway (a name the listing could not show): still taken.
         if exists_raw(&parent, name, path)? {
             return Err(NsError::at(NsErrorKind::AlreadyExists, path));
-        }
-        if let Some(c) = find_conflict(&parent, name, None, path)? {
-            return Err(conflict_error(c, path));
         }
         let md = create_filled(&parent, name, data, path)?;
         sync_dir(&parent).map_err(|e| NsError::from_io(&e, path))?;
@@ -608,24 +641,19 @@ impl HostDir {
         if_version: Option<&Version>,
     ) -> NsResult<Version> {
         let (parent, name) = open_parent(&self.root, path)?;
+        // The listing decides case and normalisation clashes (see `list_names`); an exact match is the file we replace.
+        if let Some(Conflict::Fold) = conflict_in(&list_names(&parent, path)?, name, None) {
+            return Err(NsError::at(NsErrorKind::CaseCollision, path));
+        }
         match lookup(&parent, name, path)? {
             Some((Kind::Dir, _)) => return Err(NsError::at(NsErrorKind::IsADirectory, path)),
             Some((Kind::File, md)) => {
                 refuse_hard_linked(&md, path)?;
                 check_version(&md, if_version, path)?;
-                // On a case-insensitive volume `lstat` also finds a differently-cased name; the listing tells.
-                if !self.caps.case_sensitive {
-                    if let Some(Conflict::Fold) = find_conflict(&parent, name, None, path)? {
-                        return Err(NsError::at(NsErrorKind::CaseCollision, path));
-                    }
-                }
             }
             None => {
                 if if_version.is_some() {
                     return Err(NsError::at(NsErrorKind::NotFound, path));
-                }
-                if let Some(Conflict::Fold) = find_conflict(&parent, name, None, path)? {
-                    return Err(NsError::at(NsErrorKind::CaseCollision, path));
                 }
             }
         }
@@ -664,7 +692,7 @@ impl HostDir {
     ) -> NsResult<Version> {
         if to != from && to.starts_with(from) {
             return Err(NsError::at(
-                NsErrorKind::InvalidInput("a directory cannot be moved into itself"),
+                NsErrorKind::InvalidInput(InputReason::MoveIntoSelf),
                 to,
             ));
         }
@@ -674,9 +702,19 @@ impl HostDir {
             return Err(NsError::at(NsErrorKind::NotFound, from));
         };
         check_version(&md, if_version, from)?;
+        // A rename onto itself is not a no-op: the name is taken. Only a rename that changes the spelling of its own
+        // name (case or normalisation form) may "collide" with the entry being renamed.
+        if from == to {
+            return Err(NsError::at(NsErrorKind::AlreadyExists, to));
+        }
         let same_dir = from.parent() == to.parent();
-        let ignore = same_dir.then_some(from_name);
-        if let Some(c) = find_conflict(&to_dir, to_name, ignore, to)? {
+        let names = list_names(&to_dir, to)?;
+        let ignore = if same_dir {
+            stored_name(&names, from_name)
+        } else {
+            None
+        };
+        if let Some(c) = conflict_in(&names, to_name, ignore) {
             return Err(conflict_error(c, to));
         }
         from_dir
@@ -695,11 +733,11 @@ impl HostDir {
     fn make_dir(&self, path: &NsPath, if_version: Option<&Version>) -> NsResult<Version> {
         no_version(if_version, path)?;
         let (parent, name) = open_parent(&self.root, path)?;
+        if let Some(c) = conflict_in(&list_names(&parent, path)?, name, None) {
+            return Err(conflict_error(c, path));
+        }
         if exists_raw(&parent, name, path)? {
             return Err(NsError::at(NsErrorKind::AlreadyExists, path));
-        }
-        if let Some(c) = find_conflict(&parent, name, None, path)? {
-            return Err(conflict_error(c, path));
         }
         #[cfg(unix)]
         let builder = {
@@ -724,22 +762,50 @@ impl HostDir {
 // Polling snapshot
 // ---------------------------------------------------------------------------------------------------------------
 
-/// Fingerprint the directory at `path` (and below, if `recursive`). `None` if it cannot be opened: gone, not a
-/// directory any more, now a symlink, or unreadable.
-fn scan(root: &Dir, path: &NsPath, recursive: bool) -> Option<Snapshot> {
-    let top = open_dir_at(root, path).ok()?;
+/// Fingerprint the directory at `path` (and below, if `recursive`).
+///
+/// Directories still to visit are kept as *paths* and opened one at a time when their turn comes, so the scan holds a
+/// bounded number of file descriptors (a few) however wide or deep the tree is. A subdirectory that has vanished or
+/// became a link or is unreadable is simply not there (its entries show up as removed); a failure that is about *us*
+/// (descriptors exhausted, an I/O error, more than `max_tracked` entries) makes the whole scan [`ScanOutcome::Incomplete`]
+/// so no half-picture is compared against the last good one.
+fn scan(root: &Dir, path: &NsPath, recursive: bool, max_tracked: usize) -> ScanOutcome {
+    let Ok(top) = open_dir_at(root, path) else {
+        return ScanOutcome::Unavailable;
+    };
+    let mut top = Some(top);
     let mut snapshot = Snapshot::new();
-    let mut stack = vec![(top, path.clone())];
-    let mut first = true;
-    while let Some((dir, dir_path)) = stack.pop() {
+    let mut pending = vec![path.clone()];
+    while let Some(dir_path) = pending.pop() {
+        let is_top = top.is_some();
+        let dir = match top.take() {
+            Some(d) => d,
+            None => match open_dir_at(root, &dir_path) {
+                Ok(d) => d,
+                Err(e) => match e.kind() {
+                    NsErrorKind::NotFound
+                    | NsErrorKind::NotADirectory
+                    | NsErrorKind::Escapes
+                    | NsErrorKind::PermissionDenied => continue,
+                    _ => return ScanOutcome::Incomplete,
+                },
+            },
+        };
         let entries = match dir.entries() {
             Ok(e) => e,
-            // The watched directory itself unreadable is the "gone" case; an unreadable subdirectory just has no entries.
-            Err(_) if first => return None,
-            Err(_) => continue,
+            Err(_) if is_top => return ScanOutcome::Unavailable,
+            Err(e)
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    || e.kind() == io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(_) => return ScanOutcome::Incomplete,
         };
-        first = false;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return ScanOutcome::Incomplete;
+            };
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
@@ -756,8 +822,12 @@ fn scan(root: &Dir, path: &NsPath, recursive: bool) -> Option<Snapshot> {
             } else if md.file_type().is_file() {
                 Kind::File
             } else {
+                // Symlinks (a loop included), FIFOs, sockets, devices: not part of the namespace, never followed.
                 continue;
             };
+            if snapshot.len() >= max_tracked {
+                return ScanOutcome::Incomplete;
+            }
             snapshot.insert(
                 child.clone(),
                 Fingerprint {
@@ -768,13 +838,11 @@ fn scan(root: &Dir, path: &NsPath, recursive: bool) -> Option<Snapshot> {
                 },
             );
             if recursive && kind == Kind::Dir {
-                if let Ok(sub) = dir.open_dir_nofollow(name) {
-                    stack.push((sub, child));
-                }
+                pending.push(child);
             }
         }
     }
-    Some(snapshot)
+    ScanOutcome::Complete(snapshot)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -895,15 +963,23 @@ impl Backend for HostDir {
     fn watch(&self, path: &NsPath, opts: WatchOpts) -> NsResult<Watch> {
         // Validate now, synchronously, so a bad path is an error here and not a thread that quietly reports nothing.
         drop(open_dir_at(&self.root, path)?);
-        let recursive = opts.recursive;
-        let baseline = scan(&self.root, path, recursive)
-            .ok_or_else(|| NsError::at(NsErrorKind::NotFound, path))?;
+        let (recursive, max_tracked) = (opts.recursive, opts.max_tracked);
+        let baseline = match scan(&self.root, path, recursive, max_tracked) {
+            ScanOutcome::Complete(s) => s,
+            ScanOutcome::Unavailable => return Err(NsError::at(NsErrorKind::NotFound, path)),
+            // Too many entries to track (or the scan could not finish): refuse rather than watch half a tree.
+            ScanOutcome::Incomplete => return Err(NsError::at(NsErrorKind::TooLarge, path)),
+        };
         let root = self
             .root
             .try_clone()
             .map_err(|e| NsError::from_io(&e, path))?;
         let watched = path.clone();
-        spawn_poller(baseline, move || scan(&root, &watched, recursive), &opts)
-            .map_err(|e| NsError::from_io(&e, path))
+        spawn_poller(
+            baseline,
+            move || scan(&root, &watched, recursive, max_tracked),
+            &opts,
+        )
+        .map_err(|e| NsError::from_io(&e, path))
     }
 }

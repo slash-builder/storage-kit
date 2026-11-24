@@ -3,7 +3,7 @@
 #![cfg(all(feature = "ns", target_os = "linux"))]
 
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use storage_kit::ns::{Backend, HostDir, NsPath, WatchOpts};
 
@@ -16,11 +16,27 @@ fn poller_threads() -> usize {
         .count()
 }
 
+/// Poll the count until it equals `want` or a deadline passes; returns the last count seen.
+///
+/// A fixed read right after `spawn` or `drop` is racy and was flaky: a new thread sets its own `comm` a moment after it
+/// starts, and the `/proc` entry of a joined thread can outlive `join` briefly. The properties under test are "the
+/// threads start" and "the threads end", so wait for them, with a generous bound so a real leak still fails.
+fn settle(want: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let n = poller_threads();
+        if n == want || Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn dropping_watches_ends_their_threads_and_leaks_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = HostDir::open_ambient(tmp.path()).unwrap();
-    assert_eq!(poller_threads(), 0);
+    assert_eq!(settle(0), 0);
 
     for round in 0..3 {
         let watches: Vec<_> = (0..5)
@@ -32,11 +48,12 @@ fn dropping_watches_ends_their_threads_and_leaks_nothing() {
                 .unwrap()
             })
             .collect();
-        assert_eq!(poller_threads(), 5, "round {round}: one thread per watch");
+        assert_eq!(settle(5), 5, "round {round}: one thread per watch");
         drop(watches);
-        // `Drop` joins the thread, so no waiting is needed: the count is final when drop returns.
+        // (That `Drop` joins its thread before returning is proven deterministically by the unit test in `watch.rs`;
+        // here we only check, with a deadline, that no poller thread outlives its watch.)
         assert_eq!(
-            poller_threads(),
+            settle(0),
             0,
             "round {round}: dropping the watches must end their threads"
         );
@@ -74,5 +91,5 @@ fn dropping_watches_ends_their_threads_and_leaks_nothing() {
         "batches were dropped, so the next one must show a gap: {next:?}"
     );
     drop(w);
-    assert_eq!(poller_threads(), 0);
+    assert_eq!(settle(0), 0);
 }

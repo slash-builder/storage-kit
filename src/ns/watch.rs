@@ -27,8 +27,12 @@ use super::path::NsPath;
 pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(250);
 /// The smallest interval a poll is allowed (a smaller request is raised to this).
 pub const MIN_INTERVAL: Duration = Duration::from_millis(10);
+/// The longest poll interval; a longer request is lowered to this. (Also keeps `Instant` arithmetic from overflowing.)
+pub const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The default cap on paths per batch.
 pub const DEFAULT_MAX_ENTRIES: usize = 1024;
+/// The default cap on entries a polling watch tracks in memory (see [`WatchOpts::max_tracked`]).
+pub const DEFAULT_MAX_TRACKED: usize = 262_144;
 /// How many undelivered batches a watch queues before it starts dropping them (which shows up as a generation gap).
 /// Bounded so a consumer that stops reading cannot make the producer grow without limit.
 pub const QUEUE_DEPTH: usize = 16;
@@ -39,11 +43,16 @@ pub const QUEUE_DEPTH: usize = 16;
 pub struct WatchOpts {
     /// Also report changes below subdirectories. Default `false`: direct children only.
     pub recursive: bool,
-    /// Poll interval for polling backends. Default 250 ms; values under 10 ms are raised to 10 ms. Ignored by backends
-    /// that are not polling.
+    /// Poll interval for polling backends. Default 250 ms; values under 10 ms are raised to 10 ms and values over one
+    /// hour ([`MAX_INTERVAL`]) are lowered to it. Ignored by backends that are not polling.
     pub interval: Duration,
     /// At most this many paths in one batch. Past it the batch is `rescan: true` with an empty `changed`.
     pub max_entries: usize,
+    /// At most this many entries a polling backend keeps in memory to compare against (the size of the watched tree).
+    /// A watch that would have to track more is refused at the start (`TooLarge`), and a watch whose tree grows past it
+    /// sends `rescan` and then reports nothing until the tree is small enough again: it is a memory bound, not a
+    /// filter. Unrelated to `max_entries`, which caps one *batch*. Default [`DEFAULT_MAX_TRACKED`].
+    pub max_tracked: usize,
 }
 
 impl Default for WatchOpts {
@@ -52,6 +61,7 @@ impl Default for WatchOpts {
             recursive: false,
             interval: DEFAULT_INTERVAL,
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_tracked: DEFAULT_MAX_TRACKED,
         }
     }
 }
@@ -78,8 +88,15 @@ impl WatchOpts {
         self
     }
 
+    /// Set [`WatchOpts::max_tracked`].
+    #[must_use]
+    pub fn max_tracked(mut self, max_tracked: usize) -> Self {
+        self.max_tracked = max_tracked;
+        self
+    }
+
     pub(crate) fn effective_interval(&self) -> Duration {
-        self.interval.max(MIN_INTERVAL)
+        self.interval.clamp(MIN_INTERVAL, MAX_INTERVAL)
     }
 }
 
@@ -320,20 +337,30 @@ pub(crate) fn diff(old: &Snapshot, new: &Snapshot) -> Vec<NsPath> {
     out
 }
 
+/// What one poll found.
+pub(crate) enum ScanOutcome {
+    /// The whole watched tree, as it is now.
+    Complete(Snapshot),
+    /// The watched directory is gone, no longer a directory, or unreadable.
+    Unavailable,
+    /// The scan could not finish (a resource limit, an I/O error, or more entries than `max_tracked`): what it saw is
+    /// not a trustworthy picture, so nothing is compared against it.
+    Incomplete,
+}
+
 /// Start the polling thread. `initial` is the baseline (taken synchronously by the caller, so a bad path is an error
-/// from `watch()`, not a silent dead thread); `scan` returns the current snapshot, or `None` when the directory is
-/// missing or unreadable.
+/// from `watch()`, not a silent dead thread); `scan` re-reads the tree.
 ///
 /// Behaviour: a change seen on one poll is reported on that poll; any number of writes between two polls are one
-/// batch; if the directory vanishes or becomes unreadable exactly one `rescan` batch is sent, the watch keeps running,
-/// and another `rescan` batch is sent when it is readable again.
+/// batch; if the directory vanishes, becomes unreadable, or cannot be scanned completely, exactly one `rescan` batch is
+/// sent, the watch keeps running, and another `rescan` batch is sent when a complete scan is possible again.
 pub(crate) fn spawn_poller<S>(
     initial: Snapshot,
     mut scan: S,
     opts: &WatchOpts,
 ) -> std::io::Result<Watch>
 where
-    S: FnMut() -> Option<Snapshot> + Send + 'static,
+    S: FnMut() -> ScanOutcome + Send + 'static,
 {
     let interval = opts.effective_interval();
     let max_entries = opts.max_entries;
@@ -348,7 +375,8 @@ where
                 let mut previous: Option<Snapshot> = Some(initial);
                 loop {
                     // Sleep for one interval, but wake at once when the Watch is dropped (unpark).
-                    let deadline = Instant::now() + interval;
+                    let started = Instant::now();
+                    let deadline = started.checked_add(interval).unwrap_or(started);
                     loop {
                         if thread_stop.load(Ordering::Acquire) {
                             return;
@@ -359,7 +387,10 @@ where
                         }
                         thread::park_timeout(deadline - now);
                     }
-                    let current = scan();
+                    let current = match scan() {
+                        ScanOutcome::Complete(s) => Some(s),
+                        ScanOutcome::Unavailable | ScanOutcome::Incomplete => None,
+                    };
                     let alive = match (&previous, &current) {
                         (Some(old), Some(new)) => {
                             let changed = diff(old, new);
@@ -444,7 +475,7 @@ mod tests {
             Snapshot::new(),
             move || {
                 let _keep = &held;
-                Some(Snapshot::new())
+                ScanOutcome::Complete(Snapshot::new())
             },
             &WatchOpts::default().interval(Duration::from_secs(30)),
         )
@@ -461,6 +492,26 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "drop must not wait out the 30 s interval"
         );
+    }
+
+    #[test]
+    fn extreme_intervals_are_clamped_not_overflowed() {
+        let huge = WatchOpts::default().interval(Duration::MAX);
+        assert_eq!(huge.effective_interval(), MAX_INTERVAL);
+        assert_eq!(
+            WatchOpts::default()
+                .interval(Duration::ZERO)
+                .effective_interval(),
+            MIN_INTERVAL
+        );
+        // The poller must start (and stop) with the extreme value; `Instant::now() + Duration::MAX` would panic.
+        let w = spawn_poller(
+            Snapshot::new(),
+            || ScanOutcome::Complete(Snapshot::new()),
+            &huge,
+        )
+        .unwrap();
+        drop(w);
     }
 
     #[test]

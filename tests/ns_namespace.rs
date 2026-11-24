@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use storage_kit::ns::{
-    Access, Backend, Entry, Kind, Memory, MemoryOptions, Namespace, NsErrorKind, NsPath, WatchOpts,
-    WriteOp,
+    Access, Backend, Entry, InputReason, Kind, Memory, MemoryOptions, Namespace, NsErrorKind,
+    NsPath, WatchOpts, WriteOp,
 };
 
 fn p(s: &str) -> NsPath {
@@ -94,27 +94,210 @@ fn mount_ancestors_are_synthesised_in_listings() {
 }
 
 #[test]
-fn a_mount_over_another_mounts_directory_merges_and_shadows() {
+fn a_real_entry_wins_over_a_mount_point_for_what_it_is() {
+    // The mount at /a has a FILE `b`; another mount sits at /a/b/c, which cannot hang off a file.
     let outer = mem();
+    outer.preload(&p("/b"), b"I am a file").unwrap();
     outer.preload(&p("/real"), b"r").unwrap();
-    outer
-        .preload(&p("/x"), b"a FILE named x in the outer mount")
-        .unwrap();
     let ns = Namespace::builder()
-        .mount(p("/data"), outer, Access::ReadWrite)
-        .mount(p("/data/x"), mem(), Access::ReadWrite)
-        .mount(p("/data/virtual/deep"), mem(), Access::ReadWrite)
+        .mount(p("/a"), outer, Access::ReadWrite)
+        .mount(p("/a/b/c"), mem(), Access::ReadWrite)
         .build()
         .unwrap();
-    // `x` is a mount, so it is a directory in the listing even though the outer mount has a file of that name.
+    // Every verb agrees that `b` is a file ...
     assert_eq!(
-        names(&ns.walk(&p("/data")).unwrap()),
-        [
-            ("real", Kind::File),
-            ("virtual", Kind::Dir),
-            ("x", Kind::Dir)
-        ]
+        names(&ns.walk(&p("/a")).unwrap()),
+        [("b", Kind::File), ("real", Kind::File)]
     );
+    assert_eq!(ns.stat(&p("/a/b")).unwrap().kind, Kind::File);
+    assert_eq!(ns.read(&p("/a/b"), 100).unwrap().0, b"I am a file");
+    assert_eq!(kind(ns.walk(&p("/a/b"))), NsErrorKind::NotADirectory);
+    // ... and the nested mount is what is refused, by a named error that points at the file in the way.
+    for result in [
+        ns.walk(&p("/a/b/c")).map(|_| ()),
+        ns.stat(&p("/a/b/c/f")).map(|_| ()),
+        ns.read(&p("/a/b/c/f"), 10).map(|_| ()),
+        ns.write(&p("/a/b/c/f"), WriteOp::Replace, b"x", None)
+            .map(|_| ()),
+        ns.watch(&p("/a/b/c"), WatchOpts::default()).map(|_| ()),
+    ] {
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), NsErrorKind::NotADirectory, "{err:?}");
+        assert_eq!(err.path().map(NsPath::as_str), Some("/a/b"));
+    }
+}
+
+#[test]
+fn a_mount_under_a_directory_or_under_nothing_works_and_lists_once() {
+    let outer = mem();
+    outer.preload(&p("/dir/keep"), b"k").unwrap();
+    let ns = Namespace::builder()
+        .mount(p("/a"), outer, Access::ReadWrite)
+        .mount(p("/a/dir/c"), mem(), Access::ReadWrite) // under a real directory
+        .mount(p("/a/virtual/deep/c"), mem(), Access::ReadWrite) // under nothing: synthetic
+        .build()
+        .unwrap();
+    assert_eq!(
+        names(&ns.walk(&p("/a")).unwrap()),
+        [("dir", Kind::Dir), ("virtual", Kind::Dir)]
+    );
+    assert_eq!(
+        names(&ns.walk(&p("/a/dir")).unwrap()),
+        [("c", Kind::Dir), ("keep", Kind::File)]
+    );
+    ns.write(&p("/a/dir/c/f"), WriteOp::Replace, b"x", None)
+        .unwrap();
+    ns.write(&p("/a/virtual/deep/c/f"), WriteOp::Replace, b"x", None)
+        .unwrap();
+    assert_eq!(ns.read(&p("/a/virtual/deep/c/f"), 10).unwrap().0, b"x");
+}
+
+#[test]
+fn a_mount_name_that_folds_equal_to_a_backend_entry_is_listed_once() {
+    let root = mem();
+    root.preload(&p("/config/file"), b"x").unwrap();
+    let ns = Namespace::builder()
+        .mount(p("/"), root, Access::ReadWrite)
+        .mount(p("/Config/sub"), mem(), Access::ReadWrite)
+        .build()
+        .unwrap();
+    let listing = ns.walk(&p("/")).unwrap();
+    assert_eq!(
+        names(&listing),
+        [("config", Kind::Dir)],
+        "one entry, the backend's spelling"
+    );
+}
+
+#[test]
+fn walk_is_sorted_by_name_in_utf8_byte_order_with_synthesised_names_merged() {
+    let root = mem();
+    root.preload(&p("/m"), b"x").unwrap();
+    root.preload(&p("/Y"), b"x").unwrap();
+    let ns = Namespace::builder()
+        .mount(p("/"), root, Access::ReadWrite)
+        .mount(p("/z/deep"), mem(), Access::ReadWrite)
+        .mount(p("/B/deep"), mem(), Access::ReadWrite)
+        .mount(p("/\u{e9}/deep"), mem(), Access::ReadWrite)
+        .mount(p("/a/deep"), mem(), Access::ReadWrite)
+        .build()
+        .unwrap();
+    let got: Vec<String> = ns
+        .walk(&p("/"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    // Upper case sorts before lower case, and the accented letter after `z`: bytes, not locale or case-folded order.
+    assert_eq!(got, ["B", "Y", "a", "m", "z", "\u{e9}"]);
+}
+
+#[test]
+fn a_read_only_mount_nested_under_a_read_write_one_is_refused() {
+    // The attack: /data is writable, /data/a/locked is meant to be read-only. Through the writable parent one renames
+    // /data/a to /data/z and writes /data/z/locked/cfg: a path no nested mount covers, onto the protected directory.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("a/locked")).unwrap();
+    std::fs::write(tmp.path().join("a/locked/cfg"), b"original").unwrap();
+    let host = Arc::new(storage_kit::ns::HostDir::open_ambient(tmp.path()).unwrap());
+    let locked =
+        Arc::new(storage_kit::ns::HostDir::open_ambient(tmp.path().join("a/locked")).unwrap());
+
+    let err = Namespace::builder()
+        .mount(p("/data"), host.clone(), Access::ReadWrite)
+        .mount(p("/data/a/locked"), locked.clone(), Access::ReadOnly)
+        .build()
+        .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        NsErrorKind::InvalidInput(InputReason::ReadOnlyUnderReadWrite)
+    );
+    assert_eq!(err.path().map(NsPath::as_str), Some("/data/a/locked"));
+
+    // The same through a root mount, and through an intermediate ancestor that is itself a mount.
+    for parent in ["/", "/data/a"] {
+        let r = Namespace::builder()
+            .mount(p(parent), mem(), Access::ReadWrite)
+            .mount(p("/data/a/locked"), mem(), Access::ReadOnly)
+            .build();
+        assert_eq!(
+            r.unwrap_err().kind(),
+            NsErrorKind::InvalidInput(InputReason::ReadOnlyUnderReadWrite),
+            "under {parent}"
+        );
+    }
+
+    // What IS allowed: read-only beside writable, read-only under read-only, writable under read-only.
+    let ns = Namespace::builder()
+        .mount(p("/data"), host.clone(), Access::ReadWrite)
+        .mount(p("/ro"), locked.clone(), Access::ReadOnly)
+        .mount(p("/ro/inner"), mem(), Access::ReadOnly)
+        .mount(p("/ro/scratch"), mem(), Access::ReadWrite)
+        .build()
+        .unwrap();
+    // The protected directory is only reachable through the read-only mount.
+    assert_eq!(
+        kind(ns.write(&p("/ro/cfg"), WriteOp::Replace, b"x", None)),
+        NsErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        kind(ns.write(&p("/ro/inner/f"), WriteOp::Replace, b"x", None)),
+        NsErrorKind::PermissionDenied
+    );
+    ns.write(&p("/ro/scratch/f"), WriteOp::Replace, b"x", None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("a/locked/cfg")).unwrap(),
+        b"original"
+    );
+}
+
+#[test]
+fn mount_points_match_case_folded() {
+    // Two points that fold equal are one point.
+    let err = Namespace::builder()
+        .mount(p("/Config"), mem(), Access::ReadWrite)
+        .mount(p("/config"), mem(), Access::ReadWrite)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), NsErrorKind::AlreadyExists);
+    // Composed forms too: `/\u{e9}` and its upper case.
+    assert!(Namespace::builder()
+        .mount(p("/\u{e9}"), mem(), Access::ReadWrite)
+        .mount(p("/\u{c9}"), mem(), Access::ReadWrite)
+        .build()
+        .is_err());
+
+    // A read-only mount answers to every spelling: no spelling routes around its grant.
+    let ro = mem();
+    ro.preload(&p("/cfg"), b"x").unwrap();
+    let ns = Namespace::builder()
+        .mount(p("/Config"), ro, Access::ReadOnly)
+        .build()
+        .unwrap();
+    for spelling in ["/Config/cfg", "/config/cfg", "/CONFIG/cfg", "/cOnFiG/cfg"] {
+        assert_eq!(ns.read(&p(spelling), 10).unwrap().0, b"x", "{spelling}");
+        assert_eq!(
+            kind(ns.write(&p(spelling), WriteOp::Replace, b"y", None)),
+            NsErrorKind::PermissionDenied,
+            "{spelling}"
+        );
+    }
+    // And a rename between two spellings of the same mount is within that mount.
+    let ns = Namespace::builder()
+        .mount(p("/Data"), mem(), Access::ReadWrite)
+        .build()
+        .unwrap();
+    ns.write(&p("/Data/f"), WriteOp::Replace, b"x", None)
+        .unwrap();
+    ns.write(
+        &p("/data/f"),
+        WriteOp::RenameWithinMount { to: p("/DATA/g") },
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(ns.read(&p("/dAtA/g"), 10).unwrap().0, b"x");
 }
 
 #[test]
@@ -198,7 +381,7 @@ fn a_rename_across_two_mounts_is_cross_mount() {
         .build()
         .unwrap();
     ns.write(&p("/a/f"), WriteOp::Replace, b"x", None).unwrap();
-    for to in ["/b/f", "/a/inner/f", "/nowhere/f"] {
+    for to in ["/b/f", "/a/inner/f"] {
         let err = ns
             .write(
                 &p("/a/f"),
@@ -208,6 +391,19 @@ fn a_rename_across_two_mounts_is_cross_mount() {
             )
             .unwrap_err();
         assert_eq!(err.kind(), NsErrorKind::CrossMount, "{to}");
+    }
+    // A destination in NO mount is not a "cross-mount" rename; there is simply nothing there. (Same for a destination
+    // that is only a synthesised mount ancestor.)
+    for to in ["/nowhere/f", "/"] {
+        let err = ns
+            .write(
+                &p("/a/f"),
+                WriteOp::RenameWithinMount { to: p(to) },
+                &[],
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), NsErrorKind::NotFound, "{to}");
     }
     // Nothing moved, nothing was half done.
     assert_eq!(ns.read(&p("/a/f"), 10).unwrap().0, b"x");

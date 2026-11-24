@@ -10,6 +10,63 @@ use std::io;
 
 use super::path::{NsPath, PathReason};
 
+/// Why an argument (not the path) was refused. A closed set of typed reasons, so an error can be carried over a wire
+/// and rebuilt on the far side without free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InputReason {
+    /// Data was given to an operation that takes none (`Remove`, `MakeDir`, `RenameWithinMount`).
+    UnexpectedData,
+    /// `if_version` was given to an operation that creates (`CreateExclusive`, `MakeDir`): there is nothing to compare.
+    VersionOnCreate,
+    /// The mount root has no parent: it cannot be removed, renamed, or be the destination of a rename.
+    MountRoot,
+    /// A directory cannot be moved into itself.
+    MoveIntoSelf,
+    /// A `ReadOnly` mount nested under a `ReadWrite` one: the parent mount could rename the directory the nested mount
+    /// is meant to protect, and write through the new name. Mount read-only trees outside any writable mount.
+    ReadOnlyUnderReadWrite,
+}
+
+impl InputReason {
+    fn describe(self) -> &'static str {
+        match self {
+            InputReason::UnexpectedData => "this operation takes no data",
+            InputReason::VersionOnCreate => "if_version is meaningless for an operation that creates",
+            InputReason::MountRoot => "the mount root has no parent and cannot be the target of this operation",
+            InputReason::MoveIntoSelf => "a directory cannot be moved into itself",
+            InputReason::ReadOnlyUnderReadWrite => {
+                "a ReadOnly mount cannot be nested under a ReadWrite mount (the parent could move it and write through the new name)"
+            }
+        }
+    }
+}
+
+/// What a backend declared it cannot do. A closed set, like [`InputReason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Feature {
+    /// `write` at all (the backend is not [`Caps::writable`](super::Caps::writable)).
+    Write,
+    /// `WriteOp::Replace` (the backend is not [`Caps::atomic_replace`](super::Caps::atomic_replace)).
+    AtomicReplace,
+    /// `watch` (the backend's watch kind is `None`).
+    Watch,
+    /// `watch` on a directory that exists only as a mount ancestor: watch the mounts below it.
+    WatchOnMountAncestor,
+}
+
+impl Feature {
+    fn describe(self) -> &'static str {
+        match self {
+            Feature::Write => "write",
+            Feature::AtomicReplace => "atomic replace",
+            Feature::Watch => "watch",
+            Feature::WatchOnMountAncestor => "watch on a directory that is only a mount ancestor",
+        }
+    }
+}
+
 /// What went wrong, as a value a caller can `match` on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -18,7 +75,7 @@ pub enum NsErrorKind {
     InvalidPath(PathReason),
     /// An argument (not the path) is wrong, e.g. data given to an operation that takes none, or `if_version` given to a
     /// create. The text says which.
-    InvalidInput(&'static str),
+    InvalidInput(InputReason),
     /// Nothing is at the path.
     NotFound,
     /// Something is already at the path (or, for a rename, at the destination).
@@ -45,7 +102,7 @@ pub enum NsErrorKind {
     /// `if_version` did not match the current version: someone else changed the entry. Re-read and retry.
     VersionMismatch,
     /// The backend declared this capability false in its [`Caps`](super::Caps).
-    Unsupported(&'static str),
+    Unsupported(Feature),
     /// A rename between two mounts. Do a copy then a remove; it cannot be atomic and the Kit does not pretend it is.
     CrossMount,
     /// Any other I/O failure, reduced to its kind. The detail is deliberately dropped (see the module docs).
@@ -127,7 +184,7 @@ impl fmt::Display for NsErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NsErrorKind::InvalidPath(r) => write!(f, "invalid path: {}", r.describe()),
-            NsErrorKind::InvalidInput(why) => write!(f, "invalid argument: {why}"),
+            NsErrorKind::InvalidInput(why) => write!(f, "invalid argument: {}", why.describe()),
             NsErrorKind::NotFound => f.write_str("not found"),
             NsErrorKind::AlreadyExists => f.write_str("already exists"),
             NsErrorKind::NotADirectory => f.write_str("not a directory"),
@@ -150,7 +207,7 @@ impl fmt::Display for NsErrorKind {
             NsErrorKind::VersionMismatch => {
                 f.write_str("version mismatch: the entry changed since it was read (re-read and retry)")
             }
-            NsErrorKind::Unsupported(what) => write!(f, "unsupported by this backend: {what}"),
+            NsErrorKind::Unsupported(what) => write!(f, "unsupported by this backend: {}", what.describe()),
             NsErrorKind::CrossMount => {
                 f.write_str("rename across mounts is not atomic and not done (copy, then remove)")
             }

@@ -19,9 +19,19 @@ use super::watch::{Watch, WatchOpts};
 
 /// An opaque token for "the state this entry was in when you looked".
 ///
-/// Returned by every `read`, `stat` and `write`; handed back as `if_version` to say "only if nothing changed". Compare
-/// for equality, nothing else: the bytes mean different things per backend and are not stable across versions of this
-/// crate. `HostDir` derives it from mtime (ns), size, inode and device; `Memory` from a counter.
+/// Returned by every `read`, `stat` and `write`; handed back as `if_version` to say "only if nothing changed".
+///
+/// - **An opaque equality token.** Compare for equality, nothing else: the bytes mean different things per backend and
+///   are not stable across versions of this crate. Do not order, parse or persist one across an upgrade.
+/// - **Valid only against its own mount.** A version taken from one mount means nothing to another: `Memory` makes
+///   every instance's versions distinct, and a `HostDir` version carries the file's device and inode. Offered to the
+///   wrong mount it is a `VersionMismatch`, never a match.
+/// - **A file's version** changes whenever its content is replaced (`HostDir` derives it from mtime in nanoseconds,
+///   size, inode and device; `Memory` from a counter).
+/// - **A directory's version** changes **at least whenever its set of entries changes** (an entry added, removed or
+///   renamed in it). It may change more often (a backend is free to bump it for other reasons), so use it as "something
+///   may have changed, re-list", never as "exactly these entries changed". It does *not* promise to change when an
+///   entry's content changes.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Version(Box<[u8]>);
 
@@ -58,11 +68,22 @@ pub enum Kind {
 
 /// One name in a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     /// The component name (inside the portable grammar; never a path).
     pub name: String,
     /// File or directory.
     pub kind: Kind,
+}
+
+impl Entry {
+    /// An entry. For backend authors.
+    pub fn new(name: impl Into<String>, kind: Kind) -> Self {
+        Entry {
+            name: name.into(),
+            kind,
+        }
+    }
 }
 
 /// The `manifest` verb: what is known about one entry.
@@ -177,6 +198,7 @@ impl Caps {
 
 /// A mount's grant, enforced by the [`Namespace`](super::Namespace) on top of the backend's own [`Caps::writable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Access {
     /// Reads and watches only; every write is `PermissionDenied`.
     ReadOnly,
@@ -194,8 +216,13 @@ pub trait Backend: Send + Sync {
     /// What this mount can do. Cheap; may be called often.
     fn caps(&self) -> Caps;
 
-    /// List a directory, sorted by name. Only entries that are addressable are listed: names outside the grammar,
-    /// temporary files, and anything that is neither a regular file nor a directory are omitted.
+    /// List a directory, **sorted by name in UTF-8 byte order** (so `B` sorts before `a`, and `z` before `é`), the whole
+    /// directory at once. Only entries that are addressable are listed: names outside the grammar, temporary files, and
+    /// anything that is neither a regular file nor a directory are omitted.
+    ///
+    /// The order is part of the contract (a caller may merge two listings, or page through one by name). Paging of `walk`
+    /// itself (a cursor, a page size) is **deferred** until a read-only content-addressed mount has exercised the trait;
+    /// it will be added as a separate, additive call.
     fn walk(&self, path: &NsPath) -> NsResult<Vec<Entry>>;
 
     /// Read a whole file. If it is larger than `max` bytes the result is `TooLarge` and nothing is returned; the

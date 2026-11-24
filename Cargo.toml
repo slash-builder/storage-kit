@@ -78,3 +78,6 @@ pretty_assertions = "1.4"
 # The conformance suite in tests/conformance.rs imports the frozen `conformance::{Case, run_suite}` harness from
 # `slashbuilder-spec-kit` on crates.io; the library is still imported as `spec_kit`.
 slashbuilder-spec-kit = "0.1"
+# Only `tests/ns_watch_fdlimit.rs` uses it, to lower RLIMIT_NOFILE for one test binary. Already in the lockfile.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

@@ -184,6 +184,8 @@ fn a_vanished_directory_sends_one_rescan_and_the_watch_survives() {
     );
 }
 
+// Unix only: it needs a symlink, which this crate's tests cannot create portably.
+#[cfg(unix)]
 #[test]
 fn a_directory_replaced_by_a_symlink_counts_as_gone() {
     let f = fixture();
@@ -193,7 +195,6 @@ fn a_directory_replaced_by_a_symlink_counts_as_gone() {
     let w = f.dir.watch(&p("/d"), fast()).unwrap();
     let mut seen = Vec::new();
     fs::remove_dir(f.root.join("d")).unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), f.root.join("d")).unwrap();
     wait(
         &w,
@@ -263,6 +264,26 @@ fn more_changes_than_max_entries_is_a_rescan_with_no_paths() {
     assert!(b.changed.is_empty());
 }
 
+/// Run `f` on its own thread and FAIL (not hang) if it has not finished after `secs`; a panic inside is re-raised.
+fn within<F: FnOnce() + Send + 'static>(secs: u64, what: &str, f: F) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(()) => handle.join().expect("the thread panicked after finishing"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: still running after {secs}s (hung: the thread is abandoned)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 #[test]
 fn dropping_the_watch_returns_at_once_even_with_a_long_interval() {
     let f = fixture();
@@ -273,8 +294,10 @@ fn dropping_the_watch_returns_at_once_even_with_a_long_interval() {
             WatchOpts::default().interval(Duration::from_secs(60)),
         )
         .unwrap();
+    // The drop runs under a deadline: a watch that never tells its thread to stop would make `Drop` join forever, and
+    // that must fail this test rather than hang the run.
     let started = Instant::now();
-    drop(w);
+    within(10, "dropping a watch", move || drop(w));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "drop took {:?}",
@@ -284,6 +307,182 @@ fn dropping_the_watch_returns_at_once_even_with_a_long_interval() {
     f.dir
         .write(&p("/after"), storage_kit::ns::WriteOp::Replace, b"x", None)
         .unwrap();
+}
+
+#[test]
+fn the_longest_possible_interval_neither_panics_nor_delays_the_drop() {
+    // `Instant::now() + Duration::MAX` overflows and panics; the interval is clamped to an hour instead.
+    let f = fixture();
+    let w = f
+        .dir
+        .watch(
+            &NsPath::root(),
+            WatchOpts::default().interval(Duration::MAX),
+        )
+        .unwrap();
+    within(10, "dropping a Duration::MAX watch", move || drop(w));
+    let w = f
+        .dir
+        .watch(
+            &NsPath::root(),
+            WatchOpts::default().interval(Duration::ZERO),
+        )
+        .unwrap();
+    fs::write(f.root.join("x"), b"1").unwrap();
+    let mut seen = Vec::new();
+    wait(
+        &w,
+        &mut seen,
+        "a change with a zero interval",
+        reports("/x"),
+    );
+}
+
+#[test]
+fn a_tree_over_max_tracked_is_refused_up_front_and_degrades_to_one_rescan_when_it_grows() {
+    use storage_kit::ns::NsErrorKind;
+    let f = fixture();
+    for i in 0..30 {
+        fs::write(f.root.join(format!("f{i:02}")), b"x").unwrap();
+    }
+    // Too big to track at the start: refused, not half-watched.
+    let err = f
+        .dir
+        .watch(&NsPath::root(), fast().max_tracked(10))
+        .unwrap_err();
+    assert_eq!(err.kind(), NsErrorKind::TooLarge);
+    assert_eq!(err.path().map(NsPath::as_str), Some("/"));
+
+    // Small at the start, grows past the bound: one rescan, then silence until it fits again, then one rescan.
+    fs::create_dir(f.root.join("small")).unwrap();
+    for i in 0..5 {
+        fs::write(f.root.join(format!("small/f{i}")), b"x").unwrap();
+    }
+    let w = f.dir.watch(&p("/small"), fast().max_tracked(8)).unwrap();
+    let mut seen = Vec::new();
+    for i in 5..20 {
+        fs::write(f.root.join(format!("small/f{i}")), b"x").unwrap();
+    }
+    let grown = wait(
+        &w,
+        &mut seen,
+        "a rescan when the tree outgrew the bound",
+        |b| b.rescan,
+    );
+    assert!(grown.changed.is_empty());
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_err(),
+        "an over-bound tree is reported once, not on every poll"
+    );
+    for i in 3..20 {
+        fs::remove_file(f.root.join(format!("small/f{i}"))).unwrap();
+    }
+    wait(&w, &mut seen, "a rescan when it fits again", |b| b.rescan);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_recursive_watch_never_follows_a_symlink_loop() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    fs::create_dir_all(f.root.join("a/b")).unwrap();
+    symlink(".", f.root.join("loop")).unwrap();
+    symlink("..", f.root.join("a/up")).unwrap();
+    symlink("../..", f.root.join("a/b/top")).unwrap();
+    symlink(&f.root, f.root.join("abs")).unwrap();
+    let started = Instant::now();
+    let w = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true))
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the scan did not terminate promptly"
+    );
+    fs::write(f.root.join("a/b/leaf"), b"x").unwrap();
+    fs::write(f.root.join("sentinel"), b"x").unwrap();
+    let mut seen = Vec::new();
+    let mut got = (false, false);
+    wait(&w, &mut seen, "the leaf and the sentinel", |b| {
+        got.0 |= b.changed.iter().any(|c| c.as_str() == "/a/b/leaf");
+        got.1 |= b.changed.iter().any(|c| c.as_str() == "/sentinel");
+        got.0 && got.1
+    });
+    for b in &seen {
+        for c in &b.changed {
+            let s = c.as_str();
+            assert!(
+                !(s.contains("/loop")
+                    || s.contains("/up")
+                    || s.contains("/top")
+                    || s.contains("/abs")),
+                "a path through a symlink was reported: {s}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_swapped_for_an_in_root_symlink_during_a_scan_is_never_followed() {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let f = fixture();
+    fs::create_dir(f.root.join("d")).unwrap();
+    fs::write(f.root.join("d/ok.txt"), b"x").unwrap();
+    fs::create_dir(f.root.join("elsewhere")).unwrap();
+    fs::write(f.root.join("elsewhere/leak.txt"), b"x").unwrap();
+    for i in 0..40 {
+        fs::create_dir(f.root.join(format!("pad{i:02}"))).unwrap(); // give each scan something to do
+    }
+    let root = f.root.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flipper = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                fs::rename(root.join("d"), root.join("parked")).unwrap();
+                symlink("elsewhere", root.join("d")).unwrap();
+                fs::remove_file(root.join("d")).unwrap();
+                fs::rename(root.join("parked"), root.join("d")).unwrap();
+            }
+        })
+    };
+    let w = f
+        .dir
+        .watch(
+            &NsPath::root(),
+            WatchOpts::default()
+                .interval(Duration::from_millis(10))
+                .recursive(true),
+        )
+        .unwrap();
+    let started = Instant::now();
+    let mut leaked = Vec::new();
+    let mut batches = 0;
+    while started.elapsed() < Duration::from_secs(3) {
+        if let Ok(b) = w.recv_timeout(Duration::from_millis(50)) {
+            batches += 1;
+            leaked.extend(
+                b.changed
+                    .iter()
+                    .filter(|c| c.as_str() == "/d/leak.txt")
+                    .cloned(),
+            );
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().unwrap();
+    eprintln!("scan race: {batches} batches");
+    assert!(
+        batches > 10,
+        "the flipping must have produced changes to report"
+    );
+    assert!(
+        leaked.is_empty(),
+        "the scan followed an in-root symlink into another directory: {leaked:?}"
+    );
 }
 
 #[test]

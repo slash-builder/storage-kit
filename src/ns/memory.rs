@@ -5,29 +5,32 @@
 //!
 //! - `if_version` is **exact**: the check and the change happen under one lock.
 //! - `watch` is **immediate** ([`WatchKind::Native`]): the batch is queued before the writing call returns.
-//! - Versions are a per-process counter; a directory's version changes when an entry is added, removed or renamed in it.
+//! - Versions are a counter made unique **per instance** (an instance number and a random part in its high bits), so a
+//!   version from one `Memory` never validates against another. A directory's version changes whenever an entry is
+//!   added to, removed from or renamed in it (and may change more often).
 //! - No ownership or mode (`owner_mode` is false), no hard links, no symlinks; nothing to escape from.
 //!
 //! [`MemoryOptions`] can switch capabilities off so the suite can prove a backend that declares a capability false
 //! really returns `Unsupported` for it.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::backend::{Backend, Caps, Entry, Kind, Stat, Version, WatchKind, WriteOp};
-use super::error::{NsError, NsErrorKind, NsResult};
+use super::error::{Feature, InputReason, NsError, NsErrorKind, NsResult};
 use super::path::{case_fold_key, NsPath};
-use super::watch::{BatchSender, Watch, WatchOpts};
+use super::watch::{new_epoch, BatchSender, Watch, WatchOpts};
 
 /// Which optional capabilities a [`Memory`] provides. The default is all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemoryOptions {
-    /// `write` is available. When false every `write` is `Unsupported("write")`.
+    /// `write` is available. When false every `write` is `Unsupported(Feature::Write)`.
     pub writable: bool,
-    /// `Replace` is available. When false it is `Unsupported("atomic replace")`.
+    /// `Replace` is available. When false it is `Unsupported(Feature::AtomicReplace)`.
     pub atomic_replace: bool,
-    /// `watch` is available. When false it is `Unsupported("watch")` and `caps().watch` is `WatchKind::None`.
+    /// `watch` is available. When false it is `Unsupported(Feature::Watch)` and `caps().watch` is `WatchKind::None`.
     pub watch: bool,
 }
 
@@ -67,11 +70,11 @@ impl Default for MemoryOptions {
 enum Node {
     File {
         data: Vec<u8>,
-        ver: u64,
+        ver: u128,
     },
     Dir {
         children: BTreeMap<String, Node>,
-        ver: u64,
+        ver: u128,
     },
 }
 
@@ -104,12 +107,23 @@ struct Watcher {
 
 struct State {
     root: Node,
-    counter: u64,
+    counter: u128,
     watchers: Vec<Watcher>,
     next_watch_id: u64,
 }
 
-fn tick(counter: &mut u64) -> u64 {
+/// The first version number of a new `Memory`: `[instance: 32][random: 32][counter: 64]`. The instance part is unique in
+/// this process and the random part makes a collision across processes vanishingly unlikely, so a version taken from
+/// one `Memory` is never equal to one of another: used as `if_version` against the wrong mount it is a
+/// `VersionMismatch`, not a lucky match.
+fn fresh_counter_base() -> u128 {
+    static INSTANCES: AtomicU32 = AtomicU32::new(0);
+    let instance = u128::from(INSTANCES.fetch_add(1, Ordering::Relaxed));
+    let random = u128::from(new_epoch() as u32);
+    (instance << 96) | (random << 64)
+}
+
+fn tick(counter: &mut u128) -> u128 {
     *counter += 1;
     *counter
 }
@@ -127,7 +141,7 @@ fn lookup<'a>(root: &'a Node, path: &NsPath) -> NsResult<&'a Node> {
     Ok(cur)
 }
 
-type DirMut<'a> = (&'a mut BTreeMap<String, Node>, &'a mut u64);
+type DirMut<'a> = (&'a mut BTreeMap<String, Node>, &'a mut u128);
 
 fn dir_mut<'a>(root: &'a mut Node, path: &NsPath) -> NsResult<DirMut<'a>> {
     let mut cur = root;
@@ -179,7 +193,7 @@ fn no_data(data: &[u8], path: &NsPath) -> NsResult<()> {
         Ok(())
     } else {
         Err(NsError::at(
-            NsErrorKind::InvalidInput("this operation takes no data"),
+            NsErrorKind::InvalidInput(InputReason::UnexpectedData),
             path,
         ))
     }
@@ -190,7 +204,7 @@ fn no_version(if_version: Option<&Version>, path: &NsPath) -> NsResult<()> {
         Ok(())
     } else {
         Err(NsError::at(
-            NsErrorKind::InvalidInput("if_version is meaningless for an operation that creates"),
+            NsErrorKind::InvalidInput(InputReason::VersionOnCreate),
             path,
         ))
     }
@@ -225,13 +239,14 @@ impl Memory {
 
     /// An empty tree with some capabilities switched off.
     pub fn with_options(opts: MemoryOptions) -> Self {
+        let base = fresh_counter_base();
         Memory {
             state: Arc::new(Mutex::new(State {
                 root: Node::Dir {
                     children: BTreeMap::new(),
-                    ver: 0,
+                    ver: base,
                 },
-                counter: 0,
+                counter: base,
                 watchers: Vec::new(),
                 next_watch_id: 0,
             })),
@@ -376,12 +391,7 @@ fn remove(
     path: &NsPath,
     if_version: Option<&Version>,
 ) -> NsResult<(Version, Vec<NsPath>)> {
-    let (parent, name) = split(
-        path,
-        NsErrorKind::InvalidInput(
-            "the mount root has no parent and cannot be the target of this operation",
-        ),
-    )?;
+    let (parent, name) = split(path, NsErrorKind::InvalidInput(InputReason::MountRoot))?;
     let State { root, counter, .. } = st;
     let (children, parent_ver) = dir_mut(root, &parent).map_err(|e| e.or_at(path))?;
     let node = children
@@ -408,14 +418,16 @@ fn rename(
     to: &NsPath,
     if_version: Option<&Version>,
 ) -> NsResult<(Version, Vec<NsPath>)> {
-    let root_err = NsErrorKind::InvalidInput(
-        "the mount root has no parent and cannot be the target of this operation",
-    );
+    let root_err = NsErrorKind::InvalidInput(InputReason::MountRoot);
     let (from_parent, from_name) = split(from, root_err)?;
     let (to_parent, to_name) = split(to, root_err)?;
-    if to != from && to.starts_with(from) {
+    if from == to {
+        // Not a no-op: the name is taken. Only a respelling of one's own name may "collide" with itself.
+        return Err(NsError::at(NsErrorKind::AlreadyExists, to));
+    }
+    if to.starts_with(from) {
         return Err(NsError::at(
-            NsErrorKind::InvalidInput("a directory cannot be moved into itself"),
+            NsErrorKind::InvalidInput(InputReason::MoveIntoSelf),
             to,
         ));
     }
@@ -542,11 +554,11 @@ impl Backend for Memory {
         if_version: Option<&Version>,
     ) -> NsResult<Version> {
         if !self.opts.writable {
-            return Err(NsError::at(NsErrorKind::Unsupported("write"), path));
+            return Err(NsError::at(NsErrorKind::Unsupported(Feature::Write), path));
         }
         if matches!(op, WriteOp::Replace) && !self.opts.atomic_replace {
             return Err(NsError::at(
-                NsErrorKind::Unsupported("atomic replace"),
+                NsErrorKind::Unsupported(Feature::AtomicReplace),
                 path,
             ));
         }
@@ -555,7 +567,7 @@ impl Backend for Memory {
 
     fn watch(&self, path: &NsPath, opts: WatchOpts) -> NsResult<Watch> {
         if !self.opts.watch {
-            return Err(NsError::at(NsErrorKind::Unsupported("watch"), path));
+            return Err(NsError::at(NsErrorKind::Unsupported(Feature::Watch), path));
         }
         let mut st = self.lock();
         match lookup(&st.root, path)? {

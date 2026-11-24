@@ -1,23 +1,67 @@
-//! `HostDir` confinement, tested against a real directory. Unix-only where the test needs a symlink, a FIFO or a hard
-//! link; everything is a *named error kind*, never a message match.
-#![cfg(all(feature = "ns", unix))]
+//! `HostDir` confinement, tested against a real directory. Everything is a *named error kind*, never a message match.
+//!
+//! The tests that need a symlink, a FIFO, a hard link, Unix permission bits or Unix file names are `#[cfg(unix)]`; the
+//! rest (collisions, limits, versions, errors that must not leak a host path, atomic replace) run on every platform,
+//! Windows included. Every test that can hang (a blocking FIFO open, a watch that never stops) runs under a deadline, so
+//! a regression FAILS fast instead of hanging CI.
+#![cfg(feature = "ns")]
 
 use std::fs;
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use storage_kit::ns::{Backend, HostDir, Kind, NsErrorKind, NsPath, WriteOp};
+#[cfg(unix)]
+use storage_kit::ns::Kind;
+use storage_kit::ns::{Backend, HostDir, NsErrorKind, NsPath, WriteOp};
 
+#[cfg(unix)]
 const OUTSIDE: &[u8] = b"OUTSIDE-SECRET";
+#[cfg(unix)]
 const INSIDE: &[u8] = b"inside";
+#[cfg(unix)]
+const OTHER_INSIDE: &[u8] = b"OTHER-INSIDE";
 
-/// A host layout: `<tmp>/root` is the mount, `<tmp>/outside` is what a symlink must never reach.
+/// Run `f` on its own thread and fail (not hang) if it has not finished after `secs`. A panic inside `f` is re-raised.
+#[cfg(unix)]
+fn within<F: FnOnce() + Send + 'static>(secs: u64, what: &str, f: F) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(()) => handle
+            .join()
+            .expect("the watched thread panicked after finishing"),
+        Err(RecvTimeoutError::Timeout) => {
+            panic!(
+                "{what}: still running after {secs}s: something blocks or never stops (the thread is abandoned)"
+            )
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+/// A host layout: `<tmp>/root` is the mount; on Unix `<tmp>/outside` is what a symlink must never reach.
 struct Fixture {
     _tmp: tempfile::TempDir,
     root: PathBuf,
+    #[cfg(unix)]
     outside: PathBuf,
     dir: HostDir,
 }
@@ -28,14 +72,19 @@ fn fixture() -> Fixture {
         .tempdir()
         .unwrap();
     let root = tmp.path().join("root");
-    let outside = tmp.path().join("outside");
     fs::create_dir(&root).unwrap();
-    fs::create_dir(&outside).unwrap();
-    fs::write(outside.join("secret.txt"), OUTSIDE).unwrap();
+    #[cfg(unix)]
+    let outside = {
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), OUTSIDE).unwrap();
+        outside
+    };
     let dir = HostDir::open_ambient(&root).unwrap();
     Fixture {
         _tmp: tmp,
         root,
+        #[cfg(unix)]
         outside,
         dir,
     }
@@ -52,6 +101,7 @@ fn kind<T: std::fmt::Debug>(r: Result<T, storage_kit::ns::NsError>) -> NsErrorKi
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_out_of_the_root_is_refused_on_read_write_and_walk() {
     let f = fixture();
@@ -144,6 +194,7 @@ fn a_symlink_out_of_the_root_is_refused_on_read_write_and_walk() {
     assert_eq!(names, ["mine"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_that_stays_inside_the_root_is_refused_too() {
     let f = fixture();
@@ -170,144 +221,165 @@ fn a_symlink_that_stays_inside_the_root_is_refused_too() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_swapped_in_during_use_never_yields_outside_content() {
     let f = fixture();
-    fs::write(f.root.join("f"), INSIDE).unwrap();
-    let stop = AtomicBool::new(false);
-    let (mut ok, mut escapes, mut other) = (0u64, 0u64, 0u64);
+    within(
+        60,
+        "a_symlink_swapped_in_during_use_never_yields_outside_content",
+        move || {
+            fs::write(f.root.join("f"), INSIDE).unwrap();
+            let stop = AtomicBool::new(false);
+            let (mut ok, mut escapes, mut other) = (0u64, 0u64, 0u64);
 
-    std::thread::scope(|s| {
-        // The attacker flips `f` between a regular file and a symlink to the outside secret, atomically, with rename.
-        s.spawn(|| {
-            let mut i = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                let _ = fs::remove_file(f.root.join("flip"));
-                symlink(f.outside.join("secret.txt"), f.root.join("flip")).unwrap();
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-                fs::write(f.root.join("flip"), INSIDE).unwrap();
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-                i += 1;
-            }
-            assert!(i > 0);
-        });
-        // The reader reads in a loop for a bounded time.
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(5)
-            && (started.elapsed() < Duration::from_millis(1500) || ok == 0 || escapes == 0)
-        {
-            match f.dir.read(&p("/f"), 1024) {
-                Ok((bytes, _)) => {
-                    assert_eq!(
-                        bytes, INSIDE,
-                        "read returned content that is not the inside file's"
-                    );
-                    assert!(!bytes.windows(OUTSIDE.len()).any(|w| w == OUTSIDE));
-                    ok += 1;
+            std::thread::scope(|s| {
+                // The attacker flips `f` between a regular file and a symlink to the outside secret, atomically, with rename.
+                s.spawn(|| {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = fs::remove_file(f.root.join("flip"));
+                        symlink(f.outside.join("secret.txt"), f.root.join("flip")).unwrap();
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                        fs::write(f.root.join("flip"), INSIDE).unwrap();
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                        i += 1;
+                    }
+                    assert!(i > 0);
+                });
+                // The reader reads in a loop for a bounded time.
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_secs(5)
+                    && (started.elapsed() < Duration::from_millis(1500) || ok == 0 || escapes == 0)
+                {
+                    match f.dir.read(&p("/f"), 1024) {
+                        Ok((bytes, _)) => {
+                            assert_eq!(
+                                bytes, INSIDE,
+                                "read returned content that is not the inside file's"
+                            );
+                            assert!(!bytes.windows(OUTSIDE.len()).any(|w| w == OUTSIDE));
+                            ok += 1;
+                        }
+                        Err(e) if e.kind() == NsErrorKind::Escapes => escapes += 1,
+                        Err(_) => other += 1,
+                    }
                 }
-                Err(e) if e.kind() == NsErrorKind::Escapes => escapes += 1,
-                Err(_) => other += 1,
-            }
-        }
-        stop.store(true, Ordering::Relaxed);
-    });
-    eprintln!("symlink swap race: ok={ok} escapes={escapes} other={other}");
-    assert!(
-        ok > 0,
-        "the race never let a read through; the test proved nothing"
-    );
-    assert!(
-        escapes > 0,
-        "the race never presented a symlink; the test proved nothing"
+                stop.store(true, Ordering::Relaxed);
+            });
+            eprintln!("symlink swap race: ok={ok} escapes={escapes} other={other}");
+            assert!(
+                ok > 0,
+                "the race never let a read through; the test proved nothing"
+            );
+            assert!(
+                escapes > 0,
+                "the race never presented a symlink; the test proved nothing"
+            );
+        },
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_directory_swapped_for_a_symlink_never_yields_outside_content() {
     let f = fixture();
-    fs::create_dir(f.root.join("real")).unwrap();
-    fs::write(f.root.join("real/secret.txt"), INSIDE).unwrap();
-    fs::create_dir(f.root.join("d")).unwrap();
-    fs::write(f.root.join("d/secret.txt"), INSIDE).unwrap();
-    let stop = AtomicBool::new(false);
-    let (mut ok, mut escapes) = (0u64, 0u64);
+    within(
+        60,
+        "a_directory_swapped_for_a_symlink_never_yields_outside_content",
+        move || {
+            fs::create_dir(f.root.join("real")).unwrap();
+            fs::write(f.root.join("real/secret.txt"), INSIDE).unwrap();
+            fs::create_dir(f.root.join("d")).unwrap();
+            fs::write(f.root.join("d/secret.txt"), INSIDE).unwrap();
+            let stop = AtomicBool::new(false);
+            let (mut ok, mut escapes) = (0u64, 0u64);
 
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            while !stop.load(Ordering::Relaxed) {
-                // d: directory -> symlink to the outside directory ...
-                fs::rename(f.root.join("d"), f.root.join("parked")).unwrap();
-                symlink(&f.outside, f.root.join("d")).unwrap();
-                // ... and back.
-                fs::remove_file(f.root.join("d")).unwrap();
-                fs::rename(f.root.join("parked"), f.root.join("d")).unwrap();
-            }
-        });
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(5)
-            && (started.elapsed() < Duration::from_millis(1500) || ok == 0 || escapes == 0)
-        {
-            match f.dir.read(&p("/d/secret.txt"), 1024) {
-                Ok((bytes, _)) => {
-                    assert_eq!(
-                        bytes, INSIDE,
-                        "read returned content from the outside directory"
-                    );
-                    ok += 1;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // d: directory -> symlink to the outside directory ...
+                        fs::rename(f.root.join("d"), f.root.join("parked")).unwrap();
+                        symlink(&f.outside, f.root.join("d")).unwrap();
+                        // ... and back.
+                        fs::remove_file(f.root.join("d")).unwrap();
+                        fs::rename(f.root.join("parked"), f.root.join("d")).unwrap();
+                    }
+                });
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_secs(5)
+                    && (started.elapsed() < Duration::from_millis(1500) || ok == 0 || escapes == 0)
+                {
+                    match f.dir.read(&p("/d/secret.txt"), 1024) {
+                        Ok((bytes, _)) => {
+                            assert_eq!(
+                                bytes, INSIDE,
+                                "read returned content from the outside directory"
+                            );
+                            ok += 1;
+                        }
+                        Err(e) if e.kind() == NsErrorKind::Escapes => escapes += 1,
+                        Err(_) => {}
+                    }
+                    // Writes through the swapped path must never land outside either.
+                    let _ = f
+                        .dir
+                        .write(&p("/d/dropped"), WriteOp::CreateExclusive, b"x", None);
+                    let _ = f.dir.walk(&p("/d"));
                 }
-                Err(e) if e.kind() == NsErrorKind::Escapes => escapes += 1,
-                Err(_) => {}
-            }
-            // Writes through the swapped path must never land outside either.
-            let _ = f
-                .dir
-                .write(&p("/d/dropped"), WriteOp::CreateExclusive, b"x", None);
-            let _ = f.dir.walk(&p("/d"));
-        }
-        stop.store(true, Ordering::Relaxed);
-    });
-    eprintln!("dir swap race: ok={ok} escapes={escapes}");
-    assert!(
-        ok > 0 && escapes > 0,
-        "the race must exercise both states (ok={ok}, escapes={escapes})"
-    );
-    assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
-    assert!(
-        !f.outside.join("dropped").exists(),
-        "a write escaped through a swapped directory"
-    );
-    assert_eq!(
-        fs::read_dir(&f.outside).unwrap().count(),
-        1,
-        "something was created outside the root"
+                stop.store(true, Ordering::Relaxed);
+            });
+            eprintln!("dir swap race: ok={ok} escapes={escapes}");
+            assert!(
+                ok > 0 && escapes > 0,
+                "the race must exercise both states (ok={ok}, escapes={escapes})"
+            );
+            assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
+            assert!(
+                !f.outside.join("dropped").exists(),
+                "a write escaped through a swapped directory"
+            );
+            assert_eq!(
+                fs::read_dir(&f.outside).unwrap().count(),
+                1,
+                "something was created outside the root"
+            );
+        },
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replace_never_writes_through_a_symlink_swapped_in_underneath_it() {
     let f = fixture();
-    fs::write(f.root.join("f"), INSIDE).unwrap();
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            while !stop.load(Ordering::Relaxed) {
-                let _ = fs::remove_file(f.root.join("flip"));
-                symlink(f.outside.join("secret.txt"), f.root.join("flip")).unwrap();
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-                fs::write(f.root.join("flip"), INSIDE).unwrap();
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-            }
-        });
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(1500) {
-            let _ = f.dir.write(&p("/f"), WriteOp::Replace, b"REPLACED", None);
-        }
-        stop.store(true, Ordering::Relaxed);
-    });
-    assert_eq!(
-        fs::read(f.outside.join("secret.txt")).unwrap(),
-        OUTSIDE,
-        "a replace wrote through a symlink"
+    within(
+        60,
+        "a_replace_never_writes_through_a_symlink_swapped_in_underneath_it",
+        move || {
+            fs::write(f.root.join("f"), INSIDE).unwrap();
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = fs::remove_file(f.root.join("flip"));
+                        symlink(f.outside.join("secret.txt"), f.root.join("flip")).unwrap();
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                        fs::write(f.root.join("flip"), INSIDE).unwrap();
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                    }
+                });
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(1500) {
+                    let _ = f.dir.write(&p("/f"), WriteOp::Replace, b"REPLACED", None);
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(
+                fs::read(f.outside.join("secret.txt")).unwrap(),
+                OUTSIDE,
+                "a replace wrote through a symlink"
+            );
+        },
     );
 }
 
@@ -340,17 +412,34 @@ fn case_collisions_are_refused_even_on_a_case_sensitive_volume() {
         )),
         NsErrorKind::CaseCollision
     );
-    // A collision that already exists on disk (made behind the Kit's back) is also noticed on the next create.
-    if f.dir.caps().case_sensitive {
-        fs::write(f.root.join("Pre.txt"), b"x").unwrap();
+    // The exact name is "taken", not a "collision": the two must be told apart on every platform, including the
+    // case-insensitive volumes (macOS, Windows) whose lstat answers "exists" to either spelling.
+    for (op, data) in [
+        (WriteOp::CreateExclusive, &b"2"[..]),
+        (WriteOp::MakeDir, &b""[..]),
+    ] {
         assert_eq!(
-            kind(
-                f.dir
-                    .write(&p("/pre.txt"), WriteOp::CreateExclusive, b"y", None)
-            ),
-            NsErrorKind::CaseCollision
+            kind(f.dir.write(&p("/Report.txt"), op, data, None)),
+            NsErrorKind::AlreadyExists
         );
     }
+    f.dir
+        .write(&p("/Report.txt"), WriteOp::Replace, b"3", None)
+        .unwrap();
+    // A collision that already exists on disk (made behind the Kit's back) is also noticed on the next create.
+    fs::write(f.root.join("Pre.txt"), b"x").unwrap();
+    assert_eq!(
+        kind(
+            f.dir
+                .write(&p("/pre.txt"), WriteOp::CreateExclusive, b"y", None)
+        ),
+        NsErrorKind::CaseCollision
+    );
+    assert_eq!(
+        kind(f.dir.write(&p("/PRE.TXT"), WriteOp::Replace, b"y", None)),
+        NsErrorKind::CaseCollision
+    );
+    assert_eq!(fs::read(f.root.join("Pre.txt")).unwrap(), b"x");
     let names: Vec<_> = f
         .dir
         .walk(&NsPath::root())
@@ -364,6 +453,7 @@ fn case_collisions_are_refused_even_on_a_case_sensitive_volume() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_hard_linked_file_is_refused_on_write() {
     let f = fixture();
@@ -379,7 +469,10 @@ fn a_hard_linked_file_is_refused_on_write() {
     );
     assert_eq!(fs::read(f.root.join("a")).unwrap(), b"data");
     assert_eq!(f.dir.stat(&p("/a")).unwrap().links, Some(2));
-    // A hard link to a file OUTSIDE the root is the dangerous case: writing it would change the outside file.
+    // A hard link to a file outside the root. `Replace` renames over the NAME, so it would not change the outside file
+    // even without this guard (the other name keeps the old inode and its contents); the refusal is kept because the
+    // guard is what protects an in-place write the day `append` / `at_offset` exist, and a multiply-linked file in a
+    // mount is worth refusing outright until then.
     fs::hard_link(f.outside.join("secret.txt"), f.root.join("alias")).unwrap();
     assert_eq!(
         kind(f.dir.write(&p("/alias"), WriteOp::Replace, b"pwned", None)),
@@ -394,6 +487,7 @@ fn a_hard_linked_file_is_refused_on_write() {
     assert_eq!(fs::read(f.root.join("a")).unwrap(), b"new");
 }
 
+#[cfg(unix)]
 fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo")
         .arg(path)
@@ -402,64 +496,74 @@ fn mkfifo(path: &Path) {
     assert!(status.success());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fifo_is_refused_and_never_opened() {
     let f = fixture();
-    mkfifo(&f.root.join("pipe"));
-    // If any of these opened the FIFO for reading it would block forever with no writer; the test would hang.
-    assert_eq!(kind(f.dir.read(&p("/pipe"), 1024)), NsErrorKind::NotRegular);
-    assert_eq!(kind(f.dir.stat(&p("/pipe"))), NsErrorKind::NotRegular);
-    assert_eq!(
-        kind(f.dir.write(&p("/pipe"), WriteOp::Replace, b"x", None)),
-        NsErrorKind::NotRegular
-    );
-    assert_eq!(
-        kind(f.dir.write(&p("/pipe"), WriteOp::Remove, &[], None)),
-        NsErrorKind::NotRegular
-    );
-    assert_eq!(kind(f.dir.walk(&p("/pipe"))), NsErrorKind::NotRegular);
-    assert!(
-        f.dir.walk(&NsPath::root()).unwrap().is_empty(),
-        "a FIFO is not listed"
-    );
-    assert_eq!(
-        kind(
-            f.dir
-                .write(&p("/pipe"), WriteOp::CreateExclusive, b"x", None)
-        ),
-        NsErrorKind::AlreadyExists
-    );
+    within(30, "a_fifo_is_refused_and_never_opened", move || {
+        mkfifo(&f.root.join("pipe"));
+        // If any of these opened the FIFO for reading it would block forever with no writer; the test would hang.
+        assert_eq!(kind(f.dir.read(&p("/pipe"), 1024)), NsErrorKind::NotRegular);
+        assert_eq!(kind(f.dir.stat(&p("/pipe"))), NsErrorKind::NotRegular);
+        assert_eq!(
+            kind(f.dir.write(&p("/pipe"), WriteOp::Replace, b"x", None)),
+            NsErrorKind::NotRegular
+        );
+        assert_eq!(
+            kind(f.dir.write(&p("/pipe"), WriteOp::Remove, &[], None)),
+            NsErrorKind::NotRegular
+        );
+        assert_eq!(kind(f.dir.walk(&p("/pipe"))), NsErrorKind::NotRegular);
+        assert!(
+            f.dir.walk(&NsPath::root()).unwrap().is_empty(),
+            "a FIFO is not listed"
+        );
+        assert_eq!(
+            kind(
+                f.dir
+                    .write(&p("/pipe"), WriteOp::CreateExclusive, b"x", None)
+            ),
+            NsErrorKind::AlreadyExists
+        );
+    });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fifo_swapped_in_after_the_check_cannot_hang_a_read() {
     // Race the swap: a regular file and a FIFO alternate under one name. A blocking open would hang this test.
     let f = fixture();
-    fs::write(f.root.join("f"), INSIDE).unwrap();
-    let stop = AtomicBool::new(false);
-    let mut fifo_seen = 0u64;
-    let started = Instant::now();
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            while !stop.load(Ordering::Relaxed) {
-                let _ = fs::remove_file(f.root.join("flip"));
-                mkfifo(&f.root.join("flip"));
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-                fs::write(f.root.join("flip"), INSIDE).unwrap();
-                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
-            }
-        });
-        while started.elapsed() < Duration::from_millis(1500) {
-            match f.dir.read(&p("/f"), 1024) {
-                Ok((bytes, _)) => assert_eq!(bytes, INSIDE),
-                Err(e) if e.kind() == NsErrorKind::NotRegular => fifo_seen += 1,
-                Err(_) => {}
-            }
-        }
-        stop.store(true, Ordering::Relaxed);
-    });
-    eprintln!("fifo swap race: fifo seen {fifo_seen} times");
-    assert!(started.elapsed() < Duration::from_secs(30));
+    within(
+        60,
+        "a_fifo_swapped_in_after_the_check_cannot_hang_a_read",
+        move || {
+            fs::write(f.root.join("f"), INSIDE).unwrap();
+            let stop = AtomicBool::new(false);
+            let mut fifo_seen = 0u64;
+            let started = Instant::now();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = fs::remove_file(f.root.join("flip"));
+                        mkfifo(&f.root.join("flip"));
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                        fs::write(f.root.join("flip"), INSIDE).unwrap();
+                        fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                    }
+                });
+                while started.elapsed() < Duration::from_millis(1500) {
+                    match f.dir.read(&p("/f"), 1024) {
+                        Ok((bytes, _)) => assert_eq!(bytes, INSIDE),
+                        Err(e) if e.kind() == NsErrorKind::NotRegular => fifo_seen += 1,
+                        Err(_) => {}
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            eprintln!("fifo swap race: fifo seen {fifo_seen} times");
+            assert!(started.elapsed() < Duration::from_secs(30));
+        },
+    );
 }
 
 #[test]
@@ -473,6 +577,7 @@ fn a_read_over_max_is_refused_not_truncated() {
     assert_eq!(f.dir.read(&p("/ten"), u64::MAX).unwrap().0.len(), 10);
 }
 
+#[cfg(unix)]
 #[test]
 fn names_outside_the_grammar_on_disk_are_not_listed_or_addressable() {
     let f = fixture();
@@ -491,6 +596,7 @@ fn names_outside_the_grammar_on_disk_are_not_listed_or_addressable() {
     assert_eq!(names, ["fine"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn created_files_are_0600_and_directories_0700() {
     let f = fixture();
@@ -524,6 +630,7 @@ fn created_files_are_0600_and_directories_0700() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn stat_reports_owner_mode_links_and_the_caps_say_so() {
     let f = fixture();
@@ -635,10 +742,13 @@ fn no_host_path_appears_in_any_error() {
     fs::write(f.root.join("full"), b"x").unwrap();
     fs::create_dir(f.root.join("dir")).unwrap();
     fs::write(f.root.join("dir/x"), b"x").unwrap();
-    symlink(&f.outside, f.root.join("link")).unwrap();
-    fs::write(f.root.join("h1"), b"x").unwrap();
-    fs::hard_link(f.root.join("h1"), f.root.join("h2")).unwrap();
-    mkfifo(&f.root.join("pipe"));
+    #[cfg(unix)]
+    {
+        symlink(&f.outside, f.root.join("link")).unwrap();
+        fs::write(f.root.join("h1"), b"x").unwrap();
+        fs::hard_link(f.root.join("h1"), f.root.join("h2")).unwrap();
+        mkfifo(&f.root.join("pipe"));
+    }
     let stale = f.dir.stat(&p("/file")).unwrap().version;
     fs::write(f.root.join("file"), b"changed!!!").unwrap();
 
@@ -647,12 +757,8 @@ fn no_host_path_appears_in_any_error() {
         f.dir.read(&p("/dir"), 10).unwrap_err(),
         f.dir.read(&p("/file"), 3).unwrap_err(),
         f.dir.read(&p("/file/inside"), 3).unwrap_err(),
-        f.dir.read(&p("/link"), 3).unwrap_err(),
-        f.dir.read(&p("/link/secret.txt"), 3).unwrap_err(),
-        f.dir.read(&p("/pipe"), 3).unwrap_err(),
         f.dir.walk(&p("/file")).unwrap_err(),
         f.dir.walk(&p("/nope")).unwrap_err(),
-        f.dir.walk(&p("/link")).unwrap_err(),
         f.dir.stat(&p("/nope/deeper")).unwrap_err(),
         f.dir
             .write(&p("/file"), WriteOp::CreateExclusive, b"x", None)
@@ -665,9 +771,6 @@ fn no_host_path_appears_in_any_error() {
             .unwrap_err(),
         f.dir
             .write(&p("/dir"), WriteOp::Replace, b"x", None)
-            .unwrap_err(),
-        f.dir
-            .write(&p("/h1"), WriteOp::Replace, b"x", None)
             .unwrap_err(),
         f.dir
             .write(&p("/file"), WriteOp::Replace, b"x", Some(&stale))
@@ -692,7 +795,17 @@ fn no_host_path_appears_in_any_error() {
         HostDir::open_ambient(f.root.join("file")).unwrap_err(),
     ];
     errors.push(NsPath::parse(&format!("{root_str}/../x")).unwrap_err());
-    assert!(errors.len() > 20);
+    #[cfg(unix)]
+    errors.extend([
+        f.dir.read(&p("/link"), 3).unwrap_err(),
+        f.dir.read(&p("/link/secret.txt"), 3).unwrap_err(),
+        f.dir.read(&p("/pipe"), 3).unwrap_err(),
+        f.dir.walk(&p("/link")).unwrap_err(),
+        f.dir
+            .write(&p("/h1"), WriteOp::Replace, b"x", None)
+            .unwrap_err(),
+    ]);
+    assert!(errors.len() > 16);
     for e in &errors {
         for text in [e.to_string(), format!("{e:?}"), format!("{e:#?}")] {
             assert!(!text.contains(&root_str), "host path in an error: {text}");
@@ -714,17 +827,25 @@ fn no_host_path_appears_in_any_error() {
         NsErrorKind::IsADirectory,
         NsErrorKind::TooLarge,
         NsErrorKind::NotADirectory,
-        NsErrorKind::Escapes,
-        NsErrorKind::NotRegular,
         NsErrorKind::AlreadyExists,
         NsErrorKind::CaseCollision,
         NsErrorKind::NotEmpty,
-        NsErrorKind::HardLinked,
         NsErrorKind::VersionMismatch,
     ] {
         assert!(
             kinds.contains(&want),
             "no error of kind {want:?} was exercised: {kinds:?}"
+        );
+    }
+    #[cfg(unix)]
+    for want in [
+        NsErrorKind::Escapes,
+        NsErrorKind::NotRegular,
+        NsErrorKind::HardLinked,
+    ] {
+        assert!(
+            kinds.contains(&want),
+            "no error of kind {want:?}: {kinds:?}"
         );
     }
     // A mount-relative error names the namespace path it was asked about.
@@ -766,4 +887,226 @@ fn write_ops_return_the_version_stat_reports() {
     assert_eq!(f.dir.read(&p("/f"), 100).unwrap().1, v);
     let d = f.dir.write(&p("/d"), WriteOp::MakeDir, &[], None).unwrap();
     assert_eq!(f.dir.stat(&p("/d")).unwrap().version, d);
+}
+
+/// Reads `path` in a loop against a flipper thread for a bounded time and counts what came back. `must_be` is the only
+/// content a read may ever return; anything else (typically the content of the OTHER in-root file, reached through a
+/// symlink the open should have refused) is a failure.
+#[cfg(unix)]
+fn race_reads(
+    f: std::sync::Arc<Fixture>,
+    flip: impl Fn(&Fixture) + Send + 'static,
+    path: &'static str,
+    must_be: &'static [u8],
+) -> (u64, u64) {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flipper = {
+        let (f, stop) = (f.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                flip(&f);
+            }
+        })
+    };
+    let (mut ok, mut refused) = (0u64, 0u64);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(8)
+        && (started.elapsed() < Duration::from_millis(2500) || ok == 0 || refused == 0)
+    {
+        match f.dir.read(&p(path), 1024) {
+            Ok((bytes, _)) => {
+                assert_eq!(
+                    bytes, must_be,
+                    "a read through a swapped path returned another file's content: the open followed a symlink"
+                );
+                ok += 1;
+            }
+            Err(e) if e.kind() == NsErrorKind::Escapes => refused += 1,
+            Err(_) => {}
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().unwrap();
+    (ok, refused)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_swapped_for_a_symlink_to_another_file_inside_the_root_is_never_followed() {
+    // The outside-the-root case is also stopped by cap-std's containment. A symlink to ANOTHER FILE INSIDE the root is
+    // not: only the no-follow open stands between the `lstat` (which saw a regular file) and the content of `other`.
+    // This is the test that fails if `FollowSymlinks::No` becomes `Yes` on the read open.
+    let f = std::sync::Arc::new(fixture());
+    fs::write(f.root.join("f"), INSIDE).unwrap();
+    fs::write(f.root.join("other"), OTHER_INSIDE).unwrap();
+    let f2 = f.clone();
+    within(90, "in-root file swap", move || {
+        let (ok, refused) = race_reads(
+            f2,
+            |f| {
+                let _ = fs::remove_file(f.root.join("flip"));
+                symlink("other", f.root.join("flip")).unwrap();
+                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+                fs::write(f.root.join("flip"), INSIDE).unwrap();
+                fs::rename(f.root.join("flip"), f.root.join("f")).unwrap();
+            },
+            "/f",
+            INSIDE,
+        );
+        eprintln!("in-root file swap: ok={ok} refused={refused}");
+        assert!(
+            ok > 0 && refused > 0,
+            "the race must present both states (ok={ok}, refused={refused})"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_swapped_for_a_symlink_to_another_directory_inside_the_root_is_never_followed() {
+    let f = std::sync::Arc::new(fixture());
+    fs::create_dir(f.root.join("d")).unwrap();
+    fs::write(f.root.join("d/marker"), INSIDE).unwrap();
+    fs::create_dir(f.root.join("elsewhere")).unwrap();
+    fs::write(f.root.join("elsewhere/marker"), OTHER_INSIDE).unwrap();
+    let f2 = f.clone();
+    within(90, "in-root directory swap", move || {
+        let (ok, refused) = race_reads(
+            f2,
+            |f| {
+                fs::rename(f.root.join("d"), f.root.join("parked")).unwrap();
+                symlink("elsewhere", f.root.join("d")).unwrap();
+                fs::remove_file(f.root.join("d")).unwrap();
+                fs::rename(f.root.join("parked"), f.root.join("d")).unwrap();
+            },
+            "/d/marker",
+            INSIDE,
+        );
+        eprintln!("in-root dir swap: ok={ok} refused={refused}");
+        assert!(
+            ok > 0 && refused > 0,
+            "the race must present both states (ok={ok}, refused={refused})"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn creating_over_a_symlink_name_is_refused_and_never_writes_through() {
+    let f = fixture();
+    symlink("target-that-does-not-exist", f.root.join("dangling")).unwrap();
+    fs::write(f.root.join("real"), b"real").unwrap();
+    symlink("real", f.root.join("alias")).unwrap();
+    for name in ["/dangling", "/alias"] {
+        assert_eq!(
+            kind(
+                f.dir
+                    .write(&p(name), WriteOp::CreateExclusive, b"pwned", None)
+            ),
+            NsErrorKind::AlreadyExists,
+            "{name}"
+        );
+        assert_eq!(
+            kind(f.dir.write(&p(name), WriteOp::Replace, b"pwned", None)),
+            NsErrorKind::Escapes,
+            "{name}"
+        );
+    }
+    assert!(!f.root.join("target-that-does-not-exist").exists());
+    assert_eq!(fs::read(f.root.join("real")).unwrap(), b"real");
+}
+
+#[test]
+fn an_nfd_named_file_cannot_be_overwritten_by_its_nfc_twin() {
+    // APFS and HFS+ treat the two spellings as one name. Whatever the platform, the Kit refuses to create the twin:
+    // their fold keys are equal, and the comparison is against the names as listed.
+    let f = fixture();
+    fs::write(f.root.join("e\u{301}clair.txt"), b"the NFD original").unwrap();
+    for (op, data) in [
+        (WriteOp::CreateExclusive, &b"twin"[..]),
+        (WriteOp::Replace, &b"twin"[..]),
+        (WriteOp::MakeDir, &b""[..]),
+    ] {
+        assert_eq!(
+            kind(f.dir.write(&p("/\u{e9}clair.txt"), op, data, None)),
+            NsErrorKind::CaseCollision
+        );
+    }
+    // The NFD name is not addressable (the grammar wants NFC), so it is not listed either, and nothing was overwritten.
+    assert_eq!(
+        fs::read(f.root.join("e\u{301}clair.txt")).unwrap(),
+        b"the NFD original"
+    );
+}
+
+#[test]
+fn a_rename_onto_itself_is_refused_but_a_respelling_of_its_own_name_is_allowed() {
+    let f = fixture();
+    f.dir
+        .write(&p("/Note.txt"), WriteOp::CreateExclusive, b"n", None)
+        .unwrap();
+    assert_eq!(
+        kind(f.dir.write(
+            &p("/Note.txt"),
+            WriteOp::RenameWithinMount { to: p("/Note.txt") },
+            &[],
+            None
+        )),
+        NsErrorKind::AlreadyExists
+    );
+    f.dir
+        .write(
+            &p("/Note.txt"),
+            WriteOp::RenameWithinMount { to: p("/NOTE.TXT") },
+            &[],
+            None,
+        )
+        .unwrap();
+    f.dir
+        .write(
+            &p("/NOTE.TXT"),
+            WriteOp::RenameWithinMount { to: p("/note.txt") },
+            &[],
+            None,
+        )
+        .unwrap();
+    let names: Vec<_> = f
+        .dir
+        .walk(&NsPath::root())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["note.txt"]);
+    assert_eq!(f.dir.read(&p("/note.txt"), 10).unwrap().0, b"n");
+}
+
+#[test]
+fn walk_is_sorted_by_utf8_bytes_on_a_real_directory() {
+    let f = fixture();
+    let given = [
+        "zebra",
+        "Zulu",
+        "alpha",
+        "\u{e9}clair",
+        "\u{4e2d}\u{6587}",
+        "Beta",
+        "10",
+        "9",
+    ];
+    for n in given {
+        fs::write(f.root.join(n), b"x").unwrap();
+    }
+    let got: Vec<String> = f
+        .dir
+        .walk(&NsPath::root())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let mut want: Vec<String> = given.iter().map(|s| s.to_string()).collect();
+    want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(got, want);
+    assert_eq!(got[0], "10");
+    assert_eq!(got.last().unwrap(), "\u{4e2d}\u{6587}");
 }

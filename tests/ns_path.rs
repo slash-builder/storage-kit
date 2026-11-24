@@ -244,3 +244,90 @@ fn errors_do_not_echo_the_input() {
     assert!(!format!("{e}").contains("secret"));
     assert!(!format!("{e:?}").contains("secret"));
 }
+
+#[test]
+fn format_characters_are_refused_by_a_fixed_list() {
+    // Every character on the list, and the edges just outside each range.
+    let refused: Vec<char> = [
+        0x00AD, 0x061C, 0x180E, 0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+        0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF,
+    ]
+    .iter()
+    .map(|c| char::from_u32(*c).unwrap())
+    .collect();
+    for c in &refused {
+        assert!(storage_kit::ns::is_format_character(*c), "{c:?}");
+        for path in [
+            format!("/a{c}b"),
+            format!("/{c}"),
+            format!("/dir/x{c}"),
+            format!("/{c}.txt"),
+        ] {
+            assert_eq!(reason(&path), Some(PathReason::FormatCharacter), "{path:?}");
+        }
+    }
+    // The classic spoof: a right-to-left override makes `evil\u{202E}txt.exe` DISPLAY as `evilexe.txt`.
+    assert_eq!(
+        reason("/evil\u{202E}txt.exe"),
+        Some(PathReason::FormatCharacter)
+    );
+    // ... and a zero-width space makes two different names look the same.
+    assert_eq!(
+        reason("/pass\u{200B}word"),
+        Some(PathReason::FormatCharacter)
+    );
+    // Joiners stay legal (Persian, Devanagari, emoji sequences), as do the neighbours of every range.
+    for ok in [
+        0x200Cu32, 0x200D, 0x00AC, 0x00AE, 0x061B, 0x061D, 0x180D, 0x180F, 0x200A, 0x2010, 0x2029,
+        0x202F, 0x205F, 0x2065, 0x206A, 0xFEFE, 0xFF00,
+    ] {
+        let c = char::from_u32(ok).unwrap();
+        assert!(!storage_kit::ns::is_format_character(c), "{c:?}");
+        assert_eq!(
+            reason(&format!("/a{c}b")),
+            None,
+            "U+{ok:04X} must stay legal"
+        );
+    }
+    assert_eq!(
+        reason("/\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"),
+        None
+    );
+    assert_eq!(reason("/\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"), None);
+}
+
+#[test]
+fn the_temporary_prefix_is_refused_whatever_its_case() {
+    for name in [".SKNS-TMP-1", ".Skns-Tmp-abc", ".skns-TMP-", ".sKnS-tMp-x"] {
+        assert_eq!(
+            reason(&format!("/{name}")),
+            Some(PathReason::ReservedPrefix),
+            "{name}"
+        );
+        assert_eq!(
+            reason(&format!("/d/{name}")),
+            Some(PathReason::ReservedPrefix),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        reason("/.SKNS-TMP"),
+        None,
+        "no trailing dash: not the prefix"
+    );
+}
+
+#[test]
+fn the_fold_key_equates_case_and_normalisation_forms() {
+    use storage_kit::ns::case_fold_key as key;
+    assert_eq!(key("Readme.TXT"), key("readme.txt"));
+    assert_eq!(key("stra\u{df}e"), key("STRASSE"));
+    // NFC and NFD spellings of the same name share a key: this is what stops an NFC twin being created over an NFD
+    // file that APFS/HFS+ treat as the same name.
+    assert_eq!(key("\u{e9}clair"), key("e\u{301}clair"));
+    assert_eq!(key("\u{c9}CLAIR"), key("e\u{301}clair"));
+    assert_ne!(key("a"), key("b"));
+    assert_ne!(key("e"), key("\u{e9}"));
+    // The key itself is composed.
+    assert_eq!(key("E\u{301}"), key("\u{e9}"));
+}

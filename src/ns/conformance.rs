@@ -27,7 +27,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
 use super::backend::{Backend, Caps, Entry, Kind, Stat, Version, WatchKind, WriteOp};
-use super::error::{NsError, NsErrorKind, NsResult};
+use super::error::{InputReason, NsError, NsErrorKind, NsResult};
 use super::namespace::Namespace;
 use super::path::{validate_name, NsPath};
 use super::watch::{Watch, WatchBatch, WatchCursor, WatchOpts};
@@ -489,6 +489,11 @@ pub const CASES: &[Case] = &[
     ),
     case!("make_dir_and_walk", W, make_dir_and_walk),
     case!(
+        "walk_is_sorted_in_utf8_byte_order",
+        W,
+        walk_is_sorted_in_utf8_byte_order
+    ),
+    case!(
         "case_collisions_are_refused",
         WR,
         case_collisions_are_refused
@@ -732,6 +737,33 @@ fn make_dir_and_walk(c: &Ctx<'_>) -> Outcome {
     )
 }
 
+fn walk_is_sorted_in_utf8_byte_order(c: &Ctx<'_>) -> Outcome {
+    // Chosen so that byte order differs from every "friendly" order: upper case before lower, an accented letter after
+    // `z`, a CJK name after that, an astral character last. None of them fold-collides with another.
+    let names = [
+        "zebra",
+        "Zulu",
+        "alpha",
+        "\u{e9}clair",
+        "\u{4e2d}\u{6587}",
+        "\u{1f600}smile",
+        "Beta",
+        "10",
+        "9",
+    ];
+    for n in names {
+        c.put(n, b"x")?;
+    }
+    let got: Vec<String> = c.names("")?.into_iter().map(|(n, _)| n).collect();
+    let mut want: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    ensure!(
+        got == want,
+        "walk must be sorted by name in UTF-8 byte order: got {got:?}, want {want:?}"
+    );
+    Ok(())
+}
+
 fn case_collisions_are_refused(c: &Ctx<'_>) -> Outcome {
     c.put("Readme.txt", b"1")?;
     refuse(
@@ -946,8 +978,19 @@ fn rename_within_mount(c: &Ctx<'_>) -> Outcome {
             &[],
             None,
         ),
-        NsErrorKind::InvalidInput("a directory cannot be moved into itself"),
+        NsErrorKind::InvalidInput(InputReason::MoveIntoSelf),
         "rename of a directory into itself",
+    )?;
+    // Onto itself is not a no-op: the name is taken.
+    refuse(
+        c.backend.write(
+            &c.p("c"),
+            WriteOp::RenameWithinMount { to: c.p("c") },
+            &[],
+            None,
+        ),
+        NsErrorKind::AlreadyExists,
+        "rename of an entry onto itself",
     )?;
     // A rename that changes only the case of one's own name is allowed.
     expect(
@@ -1002,7 +1045,7 @@ fn if_version_sequence(c: &Ctx<'_>) -> Outcome {
     refuse(
         c.backend
             .write(&c.p("new"), WriteOp::CreateExclusive, b"x", Some(&v1)),
-        NsErrorKind::InvalidInput("if_version is meaningless for an operation that creates"),
+        NsErrorKind::InvalidInput(InputReason::VersionOnCreate),
         "versioned create",
     )?;
     expect(
@@ -1368,11 +1411,17 @@ fn watch_over_cap(c: &Ctx<'_>) -> Outcome {
 fn watch_drop(c: &Ctx<'_>) -> Outcome {
     let opts = c.watch_opts(false).interval(Duration::from_secs(30));
     let watch = expect(c.backend.watch(&c.base, opts), "watch with a long interval")?;
+    // Drop on its own thread under a deadline: a watch that never signals its producer to stop would make `Drop` wait
+    // forever, and a regression must FAIL here, not hang the run.
     let started = Instant::now();
-    drop(watch);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(watch);
+        let _ = done_tx.send(());
+    });
     ensure!(
-        started.elapsed() < Duration::from_secs(5),
-        "dropping a watch must stop it at once, not wait out its interval ({:?})",
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "dropping a watch must stop it at once, not wait out its interval or hang (gave up after {:?})",
         started.elapsed()
     );
     // The backend must carry on normally after a watch is gone.

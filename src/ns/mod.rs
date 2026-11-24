@@ -75,14 +75,15 @@ pub mod path;
 pub mod watch;
 
 pub use backend::{Access, Backend, Caps, Entry, Kind, Stat, Version, WatchKind, WriteOp};
-pub use error::{NsError, NsErrorKind, NsResult};
+pub use error::{Feature, InputReason, NsError, NsErrorKind, NsResult};
 pub use hostdir::HostDir;
 pub use memory::{Memory, MemoryOptions};
 pub use namespace::{Namespace, NamespaceBuilder};
 pub use path::{
-    case_fold_key, validate_name, NsPath, PathReason, MAX_NAME_BYTES, MAX_PATH_BYTES, TEMP_PREFIX,
+    case_fold_key, is_format_character, validate_name, NsPath, PathReason, MAX_NAME_BYTES,
+    MAX_PATH_BYTES, TEMP_PREFIX,
 };
 pub use watch::{
-    Watch, WatchBatch, WatchCursor, WatchOpts, DEFAULT_INTERVAL, DEFAULT_MAX_ENTRIES, MIN_INTERVAL,
-    QUEUE_DEPTH,
+    Watch, WatchBatch, WatchCursor, WatchOpts, DEFAULT_INTERVAL, DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_TRACKED, MAX_INTERVAL, MIN_INTERVAL, QUEUE_DEPTH,
 };

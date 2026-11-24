@@ -2109,6 +2109,7 @@ dependencies = [
  "chrono",
  "fastcdc",
  "hex",
+ "libc",
  "memmap2",
  "pretty_assertions",
  "reqwest",
