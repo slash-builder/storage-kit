@@ -47,12 +47,29 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false, optional = true }
 bytes = { version = "1", optional = true }
 
+# The namespace layer (`storage_kit::ns`) is deliberately independent of the engine above: it uses only std, these two
+# crates and its own error type. `cap-std` confines `HostDir` to the directory handle it was opened on (no `..`, no
+# symlink escape, no ambient path lookups); `unicode-normalization` is how the portable name grammar checks NFC.
+cap-std = { version = "3", optional = true }
+# Same project and release train as `cap-std` (3.x). It supplies the two open flags `cap-std` itself keeps private: do
+# not follow a final symlink, and do not block on a FIFO. Without it the "refuse any symlink" rule would be a lstat-then-
+# open check instead of one atomic open.
+cap-fs-ext = { version = "3", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+
 [features]
-default = ["s3", "http"]
+default = ["s3", "http", "ns"]
 # S3 / S3-compatible (Wasabi, B2, R2, MinIO) transport backend.
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:bytes"]
 # HTTP(S) transport backend (talks to a Refraction server or similar).
 http = ["dep:reqwest"]
+# The namespace layer: one path-addressed tree over mounted backends (`HostDir`, `Memory`), with a polling watcher.
+# `--no-default-features --features ns` drops the cloud backends (`s3`, `http`: no aws, reqwest or hyper) but NOT the engine's local
+# dependencies (blake3, zstd, tokio, chrono, ...), which are still unconditional in this package. The `ns` code itself uses none of them
+# (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. DJ ruled 2026-11-23: ungated for now.
+ns = ["dep:cap-std", "dep:cap-fs-ext", "dep:unicode-normalization"]
+# Exposes `ns::conformance`, the suite a backend author runs against their own `Backend`. Needs `ns`.
+conformance = ["ns"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -173,12 +173,58 @@ slashbuilder-storage-kit = { version = "0.2", default-features = false, features
   compiles `backend::S3Backend`.
 - `http` (default-on) — pulls in `reqwest` and compiles
   `backend::HttpBackend`.
+- `ns` (default-on) — the [namespace layer](#namespace-layer-ns), which adds
+  `cap-std`, `cap-fs-ext` and `unicode-normalization`.
+- `conformance` — exposes `ns::conformance`, the suite a backend author runs.
 
-`default = ["s3", "http"]`, so existing consumers see no change with no
-action. A local-only consumer (no cloud transport, `PartitionStore` /
+`default = ["s3", "http", "ns"]`, so existing consumers see no change with no
+action beyond three small additional crates (opt out with `default-features = false`). A local-only consumer (no cloud transport, `PartitionStore` /
 `LocalBackend` only) can build with `default-features = false` to link
 neither cloud SDK. `LocalBackend` itself is always compiled — it has no
 cloud dependency.
+
+## Namespace layer (`ns`)
+
+> **Status: new, and not frozen.** The engine's surface above is locked; the `ns` types and the `Backend` trait are not, and
+> stay open until a read-only content-addressed backend has been written against the trait.
+
+`storage_kit::ns` is a second, **independent** layer: one path-addressed file tree
+(`/config/apps.toml`) over mounted backends, so a service stops hand-rolling
+`O_NOFOLLOW` opens and `rename` dances. It shares no types or dependencies with the
+content-addressed engine above (a test checks the source).
+
+- **`Namespace`**: a mount table; longest prefix wins, mounts nest, mount ancestors are
+  listed, `ReadOnly` is enforced, a rename across mounts is `CrossMount`.
+- **`HostDir`**: a mount over an OS directory, confined with `cap-std`: no `..`, no
+  symlink or reparse point followed, only regular files and directories, no writes to
+  multiply-linked files, atomic `Replace` (temp file, fsync, rename, fsync dir).
+  **Linux and macOS** are the targets; **Windows** compiles but is weaker and says so
+  (`Caps::strict_confinement` is `false`; see `ns::hostdir` for the list).
+- **`Memory`**: an in-memory mount with exact versions, for tests and scratch.
+- **Five verbs**: `walk`, `read`, `stat`, `write` (a closed set of `WriteOp`s, not new
+  verbs) and `watch` (a polling watcher in S0; batches carry `(epoch, generation)` so a
+  gap *is* a rescan, and paths are namespace paths only).
+- Every `read`/`stat` returns a `Version`; `write` takes `if_version`. Exact on `Memory`,
+  **best effort on `HostDir`**, and `Caps` says which.
+- Names follow one portable grammar (NFC only, no `..`, no Windows reserved names, no
+  case-colliding siblings). Errors never contain a host path.
+- Which host directories may be mounted, and by whom, is the **embedder's policy**: the
+  Kit confines to the root it is given.
+
+```rust
+use std::sync::Arc;
+use storage_kit::ns::{Access, HostDir, Namespace, NsPath, WriteOp};
+
+let ns = Namespace::builder()
+    .mount(NsPath::parse("/config")?, Arc::new(HostDir::open_ambient("/home/me/.config/app")?), Access::ReadWrite)
+    .build()?;
+let apps = NsPath::parse("/config/apps.toml")?;
+let (bytes, version) = ns.read(&apps, 1 << 20)?;
+ns.write(&apps, WriteOp::Replace, &bytes, Some(&version))?; // only if nobody changed it
+```
+
+It is pre-release surface, **not** part of the frozen engine surface, and S0 has no native
+watcher, no content-addressed mount and no remote mount.
 
 ## Partitions and dedup
 

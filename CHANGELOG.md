@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`storage_kit::ns`, the namespace layer** (new `ns` feature, on by default; `conformance` feature for the suite):
+  a sync, path-addressed, handle-free file tree over mounted backends. `Namespace` (mount table), `HostDir` (an OS
+  directory confined with `cap-std`; Linux and macOS, Windows compile-checked and weaker), `Memory`, a polling `watch`
+  with `(epoch, generation)` batches, `Version`/`if_version`, a portable name grammar, and a conformance suite. It is
+  independent of the content-addressed engine and outside its frozen surface. Adds the dependencies `cap-std`,
+  `cap-fs-ext` and `unicode-normalization` (all optional, behind `ns`).
+
 ## [0.2.0] - 2026-11-17
 
 This is the first version published on crates.io, under the package name
