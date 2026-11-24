@@ -178,7 +178,8 @@ slashbuilder-storage-kit = { version = "0.2", default-features = false, features
 - `conformance` — exposes `ns::conformance`, the suite a backend author runs.
 
 `default = ["s3", "http", "ns"]`, so existing consumers see no change with no
-action beyond three small additional crates (opt out with `default-features = false`). A local-only consumer (no cloud transport, `PartitionStore` /
+action beyond the new `ns` module: 3 direct crates (`cap-std`, `cap-fs-ext`, `unicode-normalization`) and about 11 added
+packages in the lockfile, none of them network or async crates (opt out with `default-features = false`). A local-only consumer (no cloud transport, `PartitionStore` /
 `LocalBackend` only) can build with `default-features = false` to link
 neither cloud SDK. `LocalBackend` itself is always compiled — it has no
 cloud dependency.

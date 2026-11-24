@@ -39,8 +39,8 @@
 //!
 //! **The root re-export block below *is* the frozen surface.** Names, signatures,
 //! field shapes, trait method sets, and enum variants are all locked;
-//! breaking any of them is a major-version change requiring a
-//! design decision, not a patch.
+//! breaking any of them requires a design decision, not a patch, and
+//! (this crate is pre-1.0) bumps the **minor** version; see `CHANGELOG.md`.
 //!
 //! Three rules make "frozen" mean one unambiguous thing:
 //!
@@ -52,9 +52,12 @@
 //!    As of 2026-09-22 (A4, standalone-first partitions), [`HttpBackend`]
 //!    and [`S3Backend`] are re-exported behind the `http`/`s3` Cargo
 //!    features respectively — still frozen names/shapes when the feature
-//!    is enabled, just not unconditionally compiled. `default =
-//!    ["s3", "http"]` means every consumer that hasn't opted out with
-//!    `default-features = false` sees no change at all.
+//!    is enabled, just not unconditionally compiled. The same holds for
+//!    the [`ns`] module (feature `ns`): additive, and outside the frozen
+//!    engine surface described here. `default = ["s3", "http", "ns"]`
+//!    means every consumer that hasn't opted out with
+//!    `default-features = false` sees the engine unchanged (and gains
+//!    the `ns` module and its three small direct dependencies).
 //! 2. **Being re-exported here is necessary but not sufficient.** Until
 //!    2026-09-23 `Context` and `Address` were re-exported while held
 //!    explicitly outside the freeze pending a ruling — see "`Context` and
