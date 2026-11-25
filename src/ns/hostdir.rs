@@ -61,17 +61,21 @@
 //! It compiles, and it is as strict as `cap-std` and `std` allow, but [`Caps::strict_confinement`] is `false` there and
 //! the following are **not** guaranteed:
 //!
-//! - **Hard links**: the link count is not available on stable Rust for Windows, so the hard-link refusal does not
-//!   happen. `Stat::links` is `None`.
+//! - **Hard links and file identity** come from the by-handle information `cap-std` reads when it opens a file to stat it
+//!   (volume serial number, file index, link count), so the hard-link refusal and the identity part of versions work.
+//!   This is the least-tested path (it is exercised by CI on Windows and by nothing else); the cheap directory-entry
+//!   metadata the watch scan uses carries no identity, so on Windows a polling watch cannot see an atomic replace that
+//!   keeps the same size and timestamp.
 //! - **Alternate data streams** (`name:stream`): `:` is refused in names, which blocks naming one through this API, but
 //!   a stream already on a file is not detected.
 //! - **Case-insensitive volumes**: the default NTFS volume is case-insensitive; collisions are still refused by the
 //!   grammar, but the volume itself will treat `A` and `a` as one name.
 //! - **Reparse points**: symlinks and junctions are refused as far as `std` classifies them as symlinks; other reparse
 //!   kinds (cloud placeholders, dedup) are not distinguished.
-//! - **Versions** use mtime and size only (no file identity), so a replaced file of the same size and timestamp is not
-//!   told apart. Ownership and mode are not reported. Directory `fsync` is not available, so `Replace` is atomic but its
-//!   durability across a power loss is the OS's.
+//! - **Versions** are mtime, size, file index and volume serial number. File timestamps tick coarsely (on the order of
+//!   10 ms), so an edit in place that keeps the size and lands in the same tick as the previous one is not told apart;
+//!   a replaced *file* (new file index) is. Ownership and mode are not reported. Directory `fsync` is not available, so
+//!   `Replace` is atomic but its durability across a power loss is the OS's.
 //!
 //! Treat a Windows `HostDir` as "no escape through a path, no more".
 
@@ -168,26 +172,38 @@ mod sys {
     pub fn mode(md: &Metadata) -> Option<u32> {
         Some(md.mode() & 0o7777)
     }
+    pub fn scan_inode(md: &Metadata) -> u64 {
+        md.ino()
+    }
 }
 
+/// Windows: file identity and link count come from the by-handle information `cap-std` reads when it opens a file to
+/// stat it, exposed by `cap-fs-ext`. That accessor panics for a `Metadata` that did **not** come from an open handle
+/// (the cheap `DirEntry::metadata`), so the functions below are only ever called on metadata from `lstat`/`fstat`
+/// (`symlink_metadata`, `File::metadata`, `dir_metadata`); the watch scan uses [`sys::scan_inode`], which never asks.
 #[cfg(not(unix))]
 mod sys {
+    use cap_fs_ext::MetadataExt as _;
     use cap_std::fs::Metadata;
 
-    pub fn inode(_: &Metadata) -> u64 {
-        0
+    pub fn inode(md: &Metadata) -> u64 {
+        md.ino()
     }
-    pub fn device(_: &Metadata) -> u64 {
-        0
+    pub fn device(md: &Metadata) -> u64 {
+        md.dev()
     }
-    pub fn links(_: &Metadata) -> Option<u64> {
-        None
+    pub fn links(md: &Metadata) -> Option<u64> {
+        Some(md.nlink())
     }
     pub fn owner(_: &Metadata) -> Option<u32> {
         None
     }
     pub fn mode(_: &Metadata) -> Option<u32> {
         None
+    }
+    /// For metadata that may not carry by-handle information (a directory entry's): no identity on Windows.
+    pub fn scan_inode(_: &Metadata) -> u64 {
+        0
     }
 }
 
@@ -834,7 +850,7 @@ fn scan(root: &Dir, path: &NsPath, recursive: bool, max_tracked: usize) -> ScanO
                     kind,
                     len: if kind == Kind::File { md.len() } else { 0 },
                     mtime_ns: mtime_ns(&md),
-                    inode: sys::inode(&md),
+                    inode: sys::scan_inode(&md),
                 },
             );
             if recursive && kind == Kind::Dir {
