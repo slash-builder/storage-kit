@@ -46,8 +46,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --all-features --locked
-      - run: cargo test --no-default-features --locked
+      # --no-fail-fast: one failing test binary must not hide the rest (the other platforms' results are the evidence).
+      - run: cargo test --all-features --locked --no-fail-fast
+      - run: cargo test --no-default-features --locked --no-fail-fast
 
   msrv:
     runs-on: ubuntu-24.04
