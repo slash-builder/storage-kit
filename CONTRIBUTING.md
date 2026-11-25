@@ -45,7 +45,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --no-default-features      # local-only build: no S3 or HTTP backend
 ```
 
-Requires Rust 1.88 or newer (the minimum supported version, checked in CI).
+Requires Rust 1.94 or newer (the minimum supported version, checked in CI).
 There is no private registry and no network service to set up: the tests use a
 temporary directory only. Backends:
 

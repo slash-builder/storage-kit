@@ -47,7 +47,7 @@ frozen.
 | `0.2.0` | 3 | Format v3: `Context`/`Address` retired, `create`/`open` split, partition record |
 | not yet released | 4 | Key-and-encryption seam (in design); would be `0.3.0` |
 
-The minimum supported Rust version (MSRV) is **1.88**. Raising it is a
+The minimum supported Rust version (MSRV) is **1.94**. Raising it is a
 minor-version change, noted in `CHANGELOG.md`.
 
 ## Quick start
@@ -274,7 +274,7 @@ cd storage-kit
 cargo build && cargo test
 ```
 
-Rust 2021 edition; MSRV 1.88. Needs no private registry and no network
+Rust 2021 edition; MSRV 1.94. Needs no private registry and no network
 service: the tests use a temporary directory only.
 
 ## Contributing
