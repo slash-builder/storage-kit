@@ -380,6 +380,134 @@ fn a_tree_over_max_tracked_is_refused_up_front_and_degrades_to_one_rescan_when_i
     wait(&w, &mut seen, "a rescan when it fits again", |b| b.rescan);
 }
 
+/// `levels` nested directories named `d`, built through open handles (a host path this long is not accepted by the OS).
+#[cfg(unix)]
+fn make_chain(root: &Path, levels: usize) {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    let mut cur = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
+    for _ in 0..levels {
+        cur.create_dir("d").unwrap();
+        cur = cur.open_dir("d").unwrap();
+    }
+    cur.write("leaf", b"x").unwrap();
+}
+
+#[test]
+fn a_tree_within_max_depth_is_fully_reported_and_one_beyond_it_is_refused() {
+    use storage_kit::ns::NsErrorKind;
+    let f = fixture();
+    // /a/b/c/d is 4 levels below the watched directory, with a file at each level.
+    fs::create_dir_all(f.root.join("a/b/c/d")).unwrap();
+    for n in ["a", "a/b", "a/b/c", "a/b/c/d"] {
+        fs::write(f.root.join(n).join("f"), b"1").unwrap();
+    }
+    let w = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true).max_depth(4))
+        .unwrap();
+    // Changes at every level, the deepest included, are reported by name.
+    for n in ["a/f", "a/b/f", "a/b/c/f", "a/b/c/d/f"] {
+        fs::write(f.root.join(n), b"22").unwrap();
+    }
+    let mut seen = Vec::new();
+    let mut want: std::collections::BTreeSet<&str> =
+        ["/a/f", "/a/b/f", "/a/b/c/f", "/a/b/c/d/f"].into();
+    wait(&w, &mut seen, "a change at every level", |b| {
+        assert!(!b.rescan, "within the cap there is nothing to rescan");
+        for c in &b.changed {
+            want.remove(c.as_str());
+        }
+        want.is_empty()
+    });
+
+    // One level more than the cap is refused up front, like a tree over max_tracked.
+    let err = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true).max_depth(3))
+        .unwrap_err();
+    assert_eq!(err.kind(), NsErrorKind::TooLarge);
+    // A flat watch has no depth to exceed, whatever the cap.
+    f.dir
+        .watch(&NsPath::root(), fast().max_depth(0))
+        .expect("a non-recursive watch ignores max_depth");
+}
+
+#[test]
+fn a_tree_that_grows_past_max_depth_is_one_rescan_then_silence_then_one_rescan() {
+    let f = fixture();
+    fs::create_dir(f.root.join("a")).unwrap();
+    let w = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true).max_depth(3))
+        .unwrap();
+    let mut seen = Vec::new();
+    fs::create_dir_all(f.root.join("a/b/c")).unwrap();
+    wait(&w, &mut seen, "the new directories, within the cap", |b| {
+        b.changed.iter().any(|c| c.as_str() == "/a/b/c")
+    });
+    // One level too many.
+    fs::create_dir(f.root.join("a/b/c/d")).unwrap();
+    let batch = wait(&w, &mut seen, "a rescan when the tree got too deep", |b| {
+        b.rescan
+    });
+    assert!(batch.changed.is_empty(), "a rescan carries no paths");
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a too-deep tree is reported once, not on every poll"
+    );
+    // And back within the cap: one more rescan, then it reports again.
+    fs::remove_dir(f.root.join("a/b/c/d")).unwrap();
+    wait(&w, &mut seen, "a rescan when it fits again", |b| b.rescan);
+    fs::write(f.root.join("a/b/c/f"), b"x").unwrap();
+    wait(
+        &w,
+        &mut seen,
+        "a change below the cap again",
+        reports("/a/b/c/f"),
+    );
+}
+
+/// A 2,000-level chain, created after the watch starts: the watch must answer with one `rescan` and then leave the
+/// tree alone (the scan used to take seconds per poll and repeat on every poll). Unix only: a host path 4,000 bytes
+/// deep is not something Windows path APIs accept.
+#[cfg(unix)]
+#[test]
+fn a_two_thousand_level_chain_is_one_rescan_not_a_hang() {
+    let f = fixture();
+    let w = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true))
+        .unwrap();
+    make_chain(&f.root, 2000);
+    let mut seen = Vec::new();
+    let started = Instant::now();
+    wait(&w, &mut seen, "a rescan for the too-deep tree", |b| {
+        b.rescan
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the watch took {:?} to notice",
+        started.elapsed()
+    );
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_err(),
+        "an over-deep tree is reported once, not on every poll"
+    );
+    // Refused up front too, and quickly.
+    let started = Instant::now();
+    let err = f
+        .dir
+        .watch(&NsPath::root(), fast().recursive(true))
+        .unwrap_err();
+    assert_eq!(err.kind(), storage_kit::ns::NsErrorKind::TooLarge);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_recursive_watch_never_follows_a_symlink_loop() {

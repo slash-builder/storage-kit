@@ -51,10 +51,29 @@
 //! - **Polling watch** sees a change only on the poll after it happens, and fingerprints `(name, kind, len, mtime,
 //!   inode)`: two in-place writes of the same length inside one filesystem timestamp tick can be missed. A watched
 //!   tree is held in memory, bounded by [`WatchOpts::max_tracked`](super::WatchOpts::max_tracked) (a bigger tree is
-//!   refused at the start, and degrades to a single `rescan` if it grows past it). A recursive scan keeps directory
-//!   *paths* and opens one directory at a time, so it holds a handful of file descriptors however wide the tree is; a
-//!   scan that cannot finish (descriptors, I/O error) is reported as one `rescan`, not compared as a partial picture.
+//!   refused at the start, and degrades to a single `rescan` if it grows past it). A recursive scan walks depth first and
+//!   opens each subdirectory from its parent's handle (so a scan costs one open per directory, not one per directory per
+//!   level), holding one handle per level on the way down: at most [`WatchOpts::max_depth`](super::WatchOpts::max_depth)
+//!   plus one (default 64) however wide the tree is. A tree deeper than that is an incomplete scan, handled like
+//!   `max_tracked`: refused at the start, one `rescan` if it grows past it. A scan that cannot finish (depth, entries,
+//!   descriptors, I/O error) is reported as one `rescan`, not compared as a partial picture.
 //! - **Hard-link and alias writes through other names** are only caught by the link count at the moment of the call.
+//! - **Access is the mount's, not the directory's.** `HostDir` itself is always writable; whether a mount may write is
+//!   the grant the [`Namespace`](super::Namespace) holds ([`Access`](super::Access)), enforced per mount. Two mounts
+//!   over directories that overlap share files: a write through a `ReadWrite` mount of `D` changes what a `ReadOnly`
+//!   mount of `D/locked` (or of `D` itself) reads, and so does any other process. The embedder chooses the directories
+//!   and must keep them disjoint. [`Backend::root_identity`] lets `build()` refuse the same directory mounted twice
+//!   (device and inode of the root handle); it **cannot** see an ancestor and a descendant, because the Kit keeps no
+//!   host path to compare.
+//! - **A recursive watch stops at another filesystem (Unix).** Reads, writes and `walk` through a mount are not
+//!   confined to the root's device: a filesystem mounted *inside* the directory is reachable like any subdirectory. The
+//!   polling scan is different, by choice. A directory on a different device than the watched one (found by comparing
+//!   `st_dev` on the opened handle) is listed as an entry, so a mount appearing or disappearing at that name is
+//!   reported as a change to it, but it is **not entered**: nothing beneath it is tracked or reported. Descending into
+//!   it would make the scan's cost and memory depend on a filesystem the embedder did not mean to watch (a network or
+//!   pseudo filesystem), and its tree can change without the root's mtime moving. A bind mount of the same filesystem
+//!   has the same device and is followed like a directory. Windows does not check this (a volume mount point is a
+//!   reparse point, refused as far as `std` reports it as a symlink).
 //!
 //! ## Windows is the weakest platform, and says so
 //!
@@ -74,7 +93,11 @@
 //!   kinds (cloud placeholders, dedup) are not distinguished.
 //! - **Versions** are mtime, size, file index and volume serial number. File timestamps tick coarsely (on the order of
 //!   10 ms), so an edit in place that keeps the size and lands in the same tick as the previous one is not told apart;
-//!   a replaced *file* (new file index) is. Ownership and mode are not reported. Directory `fsync` is not available, so
+//!   a replaced *file* (new file index) is. Ownership and mode are not reported. **A matching version can be wrong on
+//!   some volumes**, which is why `if_version` is best effort ([`Caps::exact_if_version`] is `false`): **FAT** reuses file
+//!   indexes (they come from where the directory entry sits, so a new file can inherit a deleted one's) and stores
+//!   timestamps to 2 seconds; **ReFS** file ids are 128 bits and the file index is 64, so two files can share an index.
+//!   On those a replaced file of the same size can compare equal and a stale `if_version` be accepted. Directory `fsync` is not available, so
 //!   `Replace` is atomic but its durability across a power loss is the OS's.
 //!
 //! Treat a Windows `HostDir` as "no escape through a path, no more".
@@ -153,15 +176,15 @@ const O_NONBLOCK: i32 = 0x4;
 const O_NONBLOCK: i32 = 0;
 
 /// Per-platform facts about a file that `std` exposes on Unix only (on stable Rust).
+///
+/// Every accessor here is total: where the platform cannot say, it answers `None` rather than panicking.
 #[cfg(unix)]
 mod sys {
-    use cap_std::fs::{Metadata, MetadataExt};
+    use cap_std::fs::{Dir, Metadata, MetadataExt};
 
-    pub fn inode(md: &Metadata) -> u64 {
-        md.ino()
-    }
-    pub fn device(md: &Metadata) -> u64 {
-        md.dev()
+    /// `(device, inode)`: what makes two handles "the same file" on this platform.
+    pub fn identity(md: &Metadata) -> Option<(u64, u64)> {
+        Some((md.dev(), md.ino()))
     }
     pub fn links(md: &Metadata) -> Option<u64> {
         Some(md.nlink())
@@ -175,25 +198,29 @@ mod sys {
     pub fn scan_inode(md: &Metadata) -> u64 {
         md.ino()
     }
+    /// The device (filesystem) an open directory lives on; the recursive scan stops where it changes.
+    pub fn device_of(dir: &Dir) -> Option<u64> {
+        dir.dir_metadata().ok().map(|md| md.dev())
+    }
 }
 
-/// Windows: file identity and link count come from the by-handle information `cap-std` reads when it opens a file to
-/// stat it, exposed by `cap-fs-ext`. That accessor panics for a `Metadata` that did **not** come from an open handle
-/// (the cheap `DirEntry::metadata`), so the functions below are only ever called on metadata from `lstat`/`fstat`
-/// (`symlink_metadata`, `File::metadata`, `dir_metadata`); the watch scan uses [`sys::scan_inode`], which never asks.
+/// Windows: file identity and link count are the by-handle information `cap-std` reads when it opens a file to stat it
+/// (volume serial number, file index, link count). A `Metadata` that did **not** come from an open handle (the cheap
+/// `DirEntry::metadata` the watch scan uses) does not carry it. `cap-fs-ext`'s `MetadataExt` accessors `expect()` it and
+/// panic on such metadata, so they are not used: these go through the `Option` accessors, and "not there" is `None`.
+/// A later change that hands the wrong kind of metadata to any of them gets a missing identity, not a crash.
 #[cfg(not(unix))]
 mod sys {
-    use cap_fs_ext::MetadataExt as _;
-    use cap_std::fs::Metadata;
+    use cap_primitives::fs::_WindowsByHandle;
+    use cap_std::fs::{Dir, Metadata};
 
-    pub fn inode(md: &Metadata) -> u64 {
-        md.ino()
-    }
-    pub fn device(md: &Metadata) -> u64 {
-        md.dev()
+    /// `(volume serial number, file index)`. The file index is 64 bits: on `ReFS`, whose file ids are 128 bits, it is a
+    /// truncation and may not be unique (see the module docs).
+    pub fn identity(md: &Metadata) -> Option<(u64, u64)> {
+        Some((u64::from(md.volume_serial_number()?), md.file_index()?))
     }
     pub fn links(md: &Metadata) -> Option<u64> {
-        Some(md.nlink())
+        md.number_of_links().map(u64::from)
     }
     pub fn owner(_: &Metadata) -> Option<u32> {
         None
@@ -204,6 +231,10 @@ mod sys {
     /// For metadata that may not carry by-handle information (a directory entry's): no identity on Windows.
     pub fn scan_inode(_: &Metadata) -> u64 {
         0
+    }
+    /// No device boundary is checked on Windows (see the module docs).
+    pub fn device_of(_: &Dir) -> Option<u64> {
+        None
     }
 }
 
@@ -224,6 +255,8 @@ mod sys {
 pub struct HostDir {
     root: Dir,
     caps: Caps,
+    /// `(device, inode)` of the root, read from the handle when it was opened. See [`Backend::root_identity`].
+    identity: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for HostDir {
@@ -259,13 +292,23 @@ impl HostDir {
         let caps = Caps {
             writable: true,
             atomic_replace: true,
+            // Best effort, and on Windows weaker than it looks (see "Windows" in the module docs): a file's identity
+            // there is its volume serial number and 64-bit file index, and a match can be wrong. FAT reuses file
+            // indexes (they derive from the directory entry's position) and keeps 2-second timestamps, so a file
+            // replaced by another of the same size can compare equal; ReFS file ids are 128 bits and are truncated to
+            // 64, so two files can share an index.
             exact_if_version: false,
             watch: WatchKind::Polling,
             owner_mode: cfg!(unix),
             case_sensitive: probe_case_sensitive(&dir),
             strict_confinement: cfg!(unix),
         };
-        Ok(HostDir { root: dir, caps })
+        let identity = sys::identity(&md);
+        Ok(HostDir {
+            root: dir,
+            caps,
+            identity,
+        })
     }
 }
 
@@ -299,10 +342,11 @@ fn probe_case_sensitive(root: &Dir) -> bool {
         };
         return match root.symlink_metadata(&swapped) {
             // The swapped name resolves to the very same entry: case-insensitive.
-            Ok(other) => {
-                !(sys::inode(&other) == sys::inode(&original)
-                    && sys::device(&other) == sys::device(&original))
-            }
+            Ok(other) => match (sys::identity(&other), sys::identity(&original)) {
+                (Some(a), Some(b)) => a != b,
+                // No identity to compare: this entry cannot tell, try another.
+                _ => continue,
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => true,
             Err(_) => continue,
         };
@@ -364,6 +408,18 @@ fn open_dir_at(root: &Dir, path: &NsPath) -> NsResult<Dir> {
         current = next;
     }
     Ok(current)
+}
+
+/// Are these two open handles the same directory? Unknown (no identity on this platform) is "no": the callers treat a
+/// different directory as the stricter case.
+fn same_directory(a: &Dir, b: &Dir) -> bool {
+    match (a.dir_metadata(), b.dir_metadata()) {
+        (Ok(x), Ok(y)) => match (sys::identity(&x), sys::identity(&y)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The parent directory handle and final name of `path`. The root has no parent: callers handle it first.
@@ -451,8 +507,10 @@ fn version_of(md: &Metadata) -> Version {
     bytes.extend_from_slice(b"h1");
     bytes.extend_from_slice(&mtime_ns(md).to_le_bytes());
     bytes.extend_from_slice(&md.len().to_le_bytes());
-    bytes.extend_from_slice(&sys::inode(md).to_le_bytes());
-    bytes.extend_from_slice(&sys::device(md).to_le_bytes());
+    // Identity is absent only for metadata that did not come from a handle; it then contributes nothing.
+    let (device, inode) = sys::identity(md).unwrap_or((0, 0));
+    bytes.extend_from_slice(&inode.to_le_bytes());
+    bytes.extend_from_slice(&device.to_le_bytes());
     Version::from_bytes(&bytes)
 }
 
@@ -723,7 +781,11 @@ impl HostDir {
         if from == to {
             return Err(NsError::at(NsErrorKind::AlreadyExists, to));
         }
-        let same_dir = from.parent() == to.parent();
+        // The same directory is decided on the two open handles, not on the spelling of their paths. Comparing paths
+        // is wrong both ways: on a case-insensitive volume `/A/x` and `/a/X` are one directory (comparing exactly
+        // would refuse a respelling as a collision), and on a case-sensitive one `/A` and `/a` can be two (comparing
+        // folded would skip the collision check against the other directory's entries and replace one of them).
+        let same_dir = same_directory(&from_dir, &to_dir);
         let names = list_names(&to_dir, to)?;
         let ignore = if same_dir {
             stored_name(&names, from_name)
@@ -780,85 +842,171 @@ impl HostDir {
 
 /// Fingerprint the directory at `path` (and below, if `recursive`).
 ///
-/// Directories still to visit are kept as *paths* and opened one at a time when their turn comes, so the scan holds a
-/// bounded number of file descriptors (a few) however wide or deep the tree is. A subdirectory that has vanished or
-/// became a link or is unreadable is simply not there (its entries show up as removed); a failure that is about *us*
-/// (descriptors exhausted, an I/O error, more than `max_tracked` entries) makes the whole scan [`ScanOutcome::Incomplete`]
-/// so no half-picture is compared against the last good one.
-fn scan(root: &Dir, path: &NsPath, recursive: bool, max_tracked: usize) -> ScanOutcome {
+/// The walk is depth first and descends **from the handle it already holds**: a subdirectory is opened with a
+/// no-follow open relative to its parent's handle, so reaching a directory `n` levels down costs one open, not `n`
+/// (reopening each pending directory from the root made a scan quadratic in depth). The handles of the directories on
+/// the way down stay open until the walk returns past them, so a scan holds at most `max_depth + 1` directory handles
+/// however wide the tree is (plus the one being listed).
+///
+/// What ends a scan early, and how:
+///
+/// - **Deeper than `max_depth`**, or more than `max_tracked` entries, or a failure that is about *us* (descriptors
+///   exhausted, an I/O error): [`ScanOutcome::Incomplete`], so no half-picture is compared against the last good one.
+///   Never an error, and never a silent skip.
+/// - **A subdirectory that has vanished, became a link, or is unreadable** is simply not there (its entries show up as
+///   removed).
+/// - **Another filesystem** (Unix): a directory on a different device than the watched one is listed as an entry but
+///   not entered. See [`WatchOpts::max_depth`](super::WatchOpts::max_depth) and the module docs.
+fn scan(
+    root: &Dir,
+    path: &NsPath,
+    recursive: bool,
+    max_tracked: usize,
+    max_depth: usize,
+) -> ScanOutcome {
     let Ok(top) = open_dir_at(root, path) else {
         return ScanOutcome::Unavailable;
     };
-    let mut top = Some(top);
+    let top_dev = sys::device_of(&top);
+    if cfg!(unix) && top_dev.is_none() {
+        return ScanOutcome::Unavailable;
+    }
     let mut snapshot = Snapshot::new();
-    let mut pending = vec![path.clone()];
-    while let Some(dir_path) = pending.pop() {
-        let is_top = top.is_some();
-        let dir = match top.take() {
-            Some(d) => d,
-            None => match open_dir_at(root, &dir_path) {
-                Ok(d) => d,
-                Err(e) => match e.kind() {
+    let subdirs = match read_level(&top, path, true, recursive, max_tracked, &mut snapshot) {
+        Ok(subdirs) => subdirs,
+        Err(outcome) => return outcome,
+    };
+    // One frame per directory on the way down: its handle, its path, and the subdirectories not yet visited.
+    // `stack.len()` is the depth of the directory a frame's child would be (the watched directory is depth 0).
+    struct Frame {
+        dir: Dir,
+        path: NsPath,
+        subdirs: Vec<String>,
+    }
+    let mut stack = vec![Frame {
+        dir: top,
+        path: path.clone(),
+        subdirs,
+    }];
+    loop {
+        let depth = stack.len();
+        let Some(frame) = stack.last_mut() else {
+            break;
+        };
+        let Some(name) = frame.subdirs.pop() else {
+            stack.pop();
+            continue;
+        };
+        if depth > max_depth {
+            return ScanOutcome::Incomplete;
+        }
+        let Some(child_path) = frame.path.child(&name) else {
+            continue;
+        };
+        let child = match frame.dir.open_dir_nofollow(&name) {
+            Ok(d) => d,
+            Err(e) => {
+                match explain_open_failure(&frame.dir, &name, &e, &child_path, Want::Dir).kind() {
                     NsErrorKind::NotFound
                     | NsErrorKind::NotADirectory
                     | NsErrorKind::Escapes
                     | NsErrorKind::PermissionDenied => continue,
                     _ => return ScanOutcome::Incomplete,
-                },
-            },
+                }
+            }
         };
-        let entries = match dir.entries() {
-            Ok(e) => e,
-            Err(_) if is_top => return ScanOutcome::Unavailable,
-            Err(e)
-                if e.kind() == io::ErrorKind::PermissionDenied
-                    || e.kind() == io::ErrorKind::NotFound =>
-            {
-                continue;
+        if let Some(top_dev) = top_dev {
+            match sys::device_of(&child) {
+                Some(dev) if dev == top_dev => {}
+                // Another filesystem is mounted here: the entry is in the snapshot, its contents are not.
+                Some(_) => continue,
+                None => return ScanOutcome::Incomplete,
             }
-            Err(_) => return ScanOutcome::Incomplete,
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return ScanOutcome::Incomplete;
-            };
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if validate_name(name).is_err() {
-                continue;
-            }
-            let Some(child) = dir_path.child(name) else {
-                continue;
-            };
-            let Ok(md) = entry.metadata() else { continue };
-            let kind = if md.file_type().is_dir() {
-                Kind::Dir
-            } else if md.file_type().is_file() {
-                Kind::File
-            } else {
-                // Symlinks (a loop included), FIFOs, sockets, devices: not part of the namespace, never followed.
-                continue;
-            };
-            if snapshot.len() >= max_tracked {
-                return ScanOutcome::Incomplete;
-            }
-            snapshot.insert(
-                child.clone(),
-                Fingerprint {
-                    kind,
-                    len: if kind == Kind::File { md.len() } else { 0 },
-                    mtime_ns: mtime_ns(&md),
-                    inode: sys::scan_inode(&md),
-                },
-            );
-            if recursive && kind == Kind::Dir {
-                pending.push(child);
-            }
+        }
+        match read_level(
+            &child,
+            &child_path,
+            false,
+            recursive,
+            max_tracked,
+            &mut snapshot,
+        ) {
+            Ok(subdirs) => stack.push(Frame {
+                dir: child,
+                path: child_path,
+                subdirs,
+            }),
+            Err(outcome) => return outcome,
         }
     }
     ScanOutcome::Complete(snapshot)
+}
+
+/// List one directory into `snapshot` and return the names of its subdirectories (empty unless `recursive`). The
+/// listing handle is dropped before this returns, so only `dir` itself stays open.
+///
+/// For the watched directory (`is_top`) an unreadable listing is `Unavailable`; for a subdirectory that is unreadable
+/// or has vanished it is an empty directory (its entries show up as removed).
+fn read_level(
+    dir: &Dir,
+    dir_path: &NsPath,
+    is_top: bool,
+    recursive: bool,
+    max_tracked: usize,
+    snapshot: &mut Snapshot,
+) -> Result<Vec<String>, ScanOutcome> {
+    let entries = match dir.entries() {
+        Ok(e) => e,
+        Err(_) if is_top => return Err(ScanOutcome::Unavailable),
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                || e.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(_) => return Err(ScanOutcome::Incomplete),
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Err(ScanOutcome::Incomplete);
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if validate_name(name).is_err() {
+            continue;
+        }
+        let Some(child) = dir_path.child(name) else {
+            continue;
+        };
+        let Ok(md) = entry.metadata() else { continue };
+        let kind = if md.file_type().is_dir() {
+            Kind::Dir
+        } else if md.file_type().is_file() {
+            Kind::File
+        } else {
+            // Symlinks (a loop included), FIFOs, sockets, devices: not part of the namespace, never followed.
+            continue;
+        };
+        if snapshot.len() >= max_tracked {
+            return Err(ScanOutcome::Incomplete);
+        }
+        snapshot.insert(
+            child,
+            Fingerprint {
+                kind,
+                len: if kind == Kind::File { md.len() } else { 0 },
+                mtime_ns: mtime_ns(&md),
+                inode: sys::scan_inode(&md),
+            },
+        );
+        if recursive && kind == Kind::Dir {
+            subdirs.push(name.to_string());
+        }
+    }
+    Ok(subdirs)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -868,6 +1016,10 @@ fn scan(root: &Dir, path: &NsPath, recursive: bool, max_tracked: usize) -> ScanO
 impl Backend for HostDir {
     fn caps(&self) -> Caps {
         self.caps
+    }
+
+    fn root_identity(&self) -> Option<(u64, u64)> {
+        self.identity
     }
 
     fn walk(&self, path: &NsPath) -> NsResult<Vec<Entry>> {
@@ -979,11 +1131,13 @@ impl Backend for HostDir {
     fn watch(&self, path: &NsPath, opts: WatchOpts) -> NsResult<Watch> {
         // Validate now, synchronously, so a bad path is an error here and not a thread that quietly reports nothing.
         drop(open_dir_at(&self.root, path)?);
-        let (recursive, max_tracked) = (opts.recursive, opts.max_tracked);
-        let baseline = match scan(&self.root, path, recursive, max_tracked) {
+        let (recursive, max_tracked, max_depth) =
+            (opts.recursive, opts.max_tracked, opts.max_depth);
+        let baseline = match scan(&self.root, path, recursive, max_tracked, max_depth) {
             ScanOutcome::Complete(s) => s,
             ScanOutcome::Unavailable => return Err(NsError::at(NsErrorKind::NotFound, path)),
-            // Too many entries to track (or the scan could not finish): refuse rather than watch half a tree.
+            // Too many entries or too deep to track (or the scan could not finish): refuse rather than watch half a
+            // tree.
             ScanOutcome::Incomplete => return Err(NsError::at(NsErrorKind::TooLarge, path)),
         };
         let root = self
@@ -993,9 +1147,248 @@ impl Backend for HostDir {
         let watched = path.clone();
         spawn_poller(
             baseline,
-            move || scan(&root, &watched, recursive, max_tracked),
+            move || scan(&root, &watched, recursive, max_tracked, max_depth),
             &opts,
         )
         .map_err(|e| NsError::from_io(&e, path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn p(s: &str) -> NsPath {
+        NsPath::parse(s).unwrap()
+    }
+
+    fn open(path: &Path) -> Dir {
+        Dir::open_ambient_dir(path, ambient_authority()).unwrap()
+    }
+
+    /// `/d/d/d/...`, `depth` levels, one directory per level, built through open handles (a path this long would not be
+    /// accepted by the OS), with a file at the bottom. Returns nothing: the tree is the point.
+    fn chain(root: &Dir, depth: usize) {
+        let mut cur = root.try_clone().unwrap();
+        for _ in 0..depth {
+            cur.create_dir("d").unwrap();
+            cur = cur.open_dir("d").unwrap();
+        }
+        cur.write("leaf", b"x").unwrap();
+    }
+
+    fn complete(outcome: ScanOutcome) -> Snapshot {
+        match outcome {
+            ScanOutcome::Complete(s) => s,
+            ScanOutcome::Incomplete => panic!("expected a complete scan, got Incomplete"),
+            ScanOutcome::Unavailable => panic!("expected a complete scan, got Unavailable"),
+        }
+    }
+
+    fn is_incomplete(outcome: &ScanOutcome) -> bool {
+        matches!(outcome, ScanOutcome::Incomplete)
+    }
+
+    /// The identity accessors must answer for a `Metadata` that did not come from an open handle (a directory entry's),
+    /// not panic. On Windows that metadata has no by-handle information and the `cap-fs-ext` accessors used to
+    /// `expect()` it; on Unix every answer is `Some`. Either way, nothing here may panic, including the version a
+    /// careless caller would derive from it.
+    #[test]
+    fn identity_accessors_never_panic_on_metadata_that_did_not_come_from_a_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f"), b"x").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let dir = open(tmp.path());
+        let mut seen = 0;
+        for entry in dir.entries().unwrap() {
+            let md = entry.unwrap().metadata().unwrap();
+            let identity = sys::identity(&md);
+            let links = sys::links(&md);
+            let _ = (sys::owner(&md), sys::mode(&md), sys::scan_inode(&md));
+            let _ = version_of(&md);
+            let _ = stat_of(&md, Kind::File);
+            #[cfg(unix)]
+            {
+                assert!(identity.is_some() && links.is_some());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (identity, links);
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+
+        // And from handles, which is where identity is promised.
+        let md = dir.dir_metadata().unwrap();
+        assert!(
+            sys::identity(&md).is_some(),
+            "a directory handle has an identity"
+        );
+        let md = dir.symlink_metadata("f").unwrap();
+        assert!(sys::identity(&md).is_some() && sys::links(&md) == Some(1));
+        let a = HostDir::open_ambient(tmp.path()).unwrap();
+        let b = HostDir::from_dir(dir).unwrap();
+        assert!(
+            a.root_identity().is_some(),
+            "a host directory has an identity"
+        );
+        assert_eq!(
+            a.root_identity(),
+            b.root_identity(),
+            "two handles on one directory report one identity"
+        );
+    }
+
+    #[test]
+    fn a_scan_stops_at_the_depth_cap_with_incomplete_not_a_partial_picture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = open(tmp.path());
+        chain(&root, 200);
+        // 200 levels fit a cap of 256 and are all there: 200 directories and the leaf.
+        let all = complete(scan(&root, &NsPath::root(), true, 1 << 20, 256));
+        assert_eq!(all.len(), 201);
+        // A cap of 64 is exceeded: no snapshot at all, not the first 64 levels.
+        assert!(is_incomplete(&scan(
+            &root,
+            &NsPath::root(),
+            true,
+            1 << 20,
+            64
+        )));
+    }
+
+    #[test]
+    fn the_cap_counts_levels_below_the_watched_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = open(tmp.path());
+        chain(&root, 3); // /d, /d/d, /d/d/d, and /d/d/d/leaf
+        for (cap, fits) in [(0, false), (2, false), (3, true), (4, true)] {
+            let out = scan(&root, &NsPath::root(), true, 1 << 20, cap);
+            assert_eq!(!is_incomplete(&out), fits, "cap {cap}");
+            if fits {
+                assert_eq!(complete(out).len(), 4, "cap {cap}");
+            }
+        }
+        // The watched directory is level 0 wherever it sits in the mount: from /d, the same tree is two levels deep.
+        let from_d = scan(&root, &p("/d"), true, 1 << 20, 2);
+        assert_eq!(complete(from_d).len(), 3);
+        // A flat watch never looks at depth.
+        assert_eq!(
+            complete(scan(&root, &NsPath::root(), false, 1 << 20, 0)).len(),
+            1
+        );
+        // An empty tree under cap 0 is complete.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(complete(scan(&open(empty.path()), &NsPath::root(), true, 1 << 20, 0)).is_empty());
+    }
+
+    /// The scan that used to reopen every pending directory from the root took 48 s on a 2,047-level chain (debug).
+    /// Unix only: the chain's host path is far past what Windows path APIs accept and its teardown is not the point.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_two_thousand_levels_deep_is_one_quick_incomplete_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = open(tmp.path());
+        chain(&root, 2000);
+        let started = Instant::now();
+        let out = scan(&root, &NsPath::root(), true, 262_144, 64);
+        let took = started.elapsed();
+        assert!(
+            is_incomplete(&out),
+            "deeper than the cap must be Incomplete"
+        );
+        assert!(
+            took < Duration::from_millis(500),
+            "a scan of a too-deep tree took {took:?}"
+        );
+    }
+
+    #[test]
+    fn the_scan_holds_one_handle_per_level_and_a_tree_within_the_cap_is_fully_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = open(tmp.path());
+        // A bushy tree 5 levels deep: every directory has two subdirectories and a file.
+        fn grow(dir: &Dir, levels: usize) {
+            dir.write("f", b"x").unwrap();
+            if levels > 0 {
+                for n in ["a", "b"] {
+                    dir.create_dir(n).unwrap();
+                    grow(&dir.open_dir(n).unwrap(), levels - 1);
+                }
+            }
+        }
+        grow(&root, 5);
+        let snap = complete(scan(&root, &NsPath::root(), true, 1 << 20, 5));
+        // 1 + 2 + 4 + 8 + 16 + 32 files, and 2 + 4 + 8 + 16 + 32 directories.
+        assert_eq!(snap.len(), 63 + 62);
+        assert!(snap.contains_key(&p("/b/a/b/a/b/f")));
+        assert!(is_incomplete(&scan(
+            &root,
+            &NsPath::root(),
+            true,
+            1 << 20,
+            4
+        )));
+    }
+
+    /// The scan does not cross onto another filesystem. `/dev/shm` is a tmpfs under `/dev` (a devtmpfs) on every
+    /// ordinary Linux; where it is not a separate device the premise is missing and the test says so and passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recursive_scan_does_not_descend_into_another_filesystem() {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(dev), Ok(shm)) = (std::fs::metadata("/dev"), std::fs::metadata("/dev/shm")) else {
+            eprintln!("skipped: /dev or /dev/shm is not there");
+            return;
+        };
+        if dev.dev() == shm.dev() {
+            eprintln!("skipped: /dev/shm is not a separate filesystem here");
+            return;
+        }
+        let Ok(inside) = tempfile::Builder::new()
+            .prefix("skns-dev-")
+            .tempdir_in("/dev/shm")
+        else {
+            eprintln!("skipped: /dev/shm is not writable here");
+            return;
+        };
+        std::fs::write(inside.path().join("deep"), b"x").unwrap();
+        let name = inside
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let root = open(Path::new("/dev"));
+        let ScanOutcome::Complete(snap) = scan(&root, &NsPath::root(), true, 1 << 20, 64) else {
+            eprintln!("skipped: /dev could not be scanned completely here");
+            return;
+        };
+        assert_eq!(
+            snap.get(&p("/shm")).map(|f| f.kind),
+            Some(Kind::Dir),
+            "the mount point is listed as a directory"
+        );
+        let below: Vec<_> = snap
+            .keys()
+            .filter(|k| k.as_str().starts_with("/shm/"))
+            .collect();
+        assert!(
+            below.is_empty(),
+            "the scan crossed into the tmpfs ({name}): {below:?}"
+        );
+        // Watching the tmpfs itself is fine: it is the watched directory, so its own device is the reference.
+        let shm_root = open(Path::new("/dev/shm"));
+        let ScanOutcome::Complete(inner) = scan(&shm_root, &NsPath::root(), true, 1 << 20, 64)
+        else {
+            panic!("/dev/shm itself must be scannable");
+        };
+        assert!(inner.contains_key(&p(&format!("/{name}/deep"))));
     }
 }

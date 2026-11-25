@@ -26,6 +26,9 @@ pub enum InputReason {
     /// A `ReadOnly` mount nested under a `ReadWrite` one: the parent mount could rename the directory the nested mount
     /// is meant to protect, and write through the new name. Mount read-only trees outside any writable mount.
     ReadOnlyUnderReadWrite,
+    /// Two mounts are over the same host directory (their backends report the same root identity). Access is enforced
+    /// per mount, so a write through one would change what the other reads, whatever grants they were given.
+    DuplicateRoot,
 }
 
 impl InputReason {
@@ -35,6 +38,9 @@ impl InputReason {
             InputReason::VersionOnCreate => "if_version is meaningless for an operation that creates",
             InputReason::MountRoot => "the mount root has no parent and cannot be the target of this operation",
             InputReason::MoveIntoSelf => "a directory cannot be moved into itself",
+            InputReason::DuplicateRoot => {
+                "two mounts are over the same host directory (access is per mount, so a write through one changes what the other reads)"
+            }
             InputReason::ReadOnlyUnderReadWrite => {
                 "a ReadOnly mount cannot be nested under a ReadWrite mount (the parent could move it and write through the new name)"
             }

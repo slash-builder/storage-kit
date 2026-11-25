@@ -33,6 +33,8 @@ pub const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_MAX_ENTRIES: usize = 1024;
 /// The default cap on entries a polling watch tracks in memory (see [`WatchOpts::max_tracked`]).
 pub const DEFAULT_MAX_TRACKED: usize = 262_144;
+/// The default cap on how many directory levels a recursive polling watch descends (see [`WatchOpts::max_depth`]).
+pub const DEFAULT_MAX_DEPTH: usize = 64;
 /// How many undelivered batches a watch queues before it starts dropping them (which shows up as a generation gap).
 /// Bounded so a consumer that stops reading cannot make the producer grow without limit.
 pub const QUEUE_DEPTH: usize = 16;
@@ -53,6 +55,20 @@ pub struct WatchOpts {
     /// sends `rescan` and then reports nothing until the tree is small enough again: it is a memory bound, not a
     /// filter. Unrelated to `max_entries`, which caps one *batch*. Default [`DEFAULT_MAX_TRACKED`].
     pub max_tracked: usize,
+    /// How many directory levels below the watched directory a **recursive** polling watch descends. Default
+    /// [`DEFAULT_MAX_DEPTH`] (64). The watched directory is level 0, its subdirectories level 1, and so on; with the
+    /// default, a directory 65 levels down is too deep. Ignored when `recursive` is `false` and by backends that do not
+    /// scan.
+    ///
+    /// A tree deeper than this is handled exactly like one with more than [`max_tracked`](Self::max_tracked) entries:
+    /// the scan is *incomplete*, so a watch that would start on one is refused (`TooLarge`), and a watch whose tree
+    /// grows past the limit sends one `rescan` and then reports nothing until the tree is within it again. It is never
+    /// an error mid-watch and never a silent skip of the deep part. Like `max_tracked` it is a bound, not a filter.
+    ///
+    /// It bounds work and descriptors: a scan holds one open directory handle per level on the way down, so at most
+    /// `max_depth + 1` at a time. Do not set it close to the process's descriptor limit; a scan that runs out of
+    /// descriptors is also reported as incomplete.
+    pub max_depth: usize,
 }
 
 impl Default for WatchOpts {
@@ -62,6 +78,7 @@ impl Default for WatchOpts {
             interval: DEFAULT_INTERVAL,
             max_entries: DEFAULT_MAX_ENTRIES,
             max_tracked: DEFAULT_MAX_TRACKED,
+            max_depth: DEFAULT_MAX_DEPTH,
         }
     }
 }
@@ -92,6 +109,13 @@ impl WatchOpts {
     #[must_use]
     pub fn max_tracked(mut self, max_tracked: usize) -> Self {
         self.max_tracked = max_tracked;
+        self
+    }
+
+    /// Set [`WatchOpts::max_depth`].
+    #[must_use]
+    pub fn max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
         self
     }
 
@@ -343,7 +367,7 @@ pub(crate) enum ScanOutcome {
     Complete(Snapshot),
     /// The watched directory is gone, no longer a directory, or unreadable.
     Unavailable,
-    /// The scan could not finish (a resource limit, an I/O error, or more entries than `max_tracked`): what it saw is
+    /// The scan could not finish (a resource limit, an I/O error, more entries than `max_tracked`, or deeper than `max_depth`): what it saw is
     /// not a trustworthy picture, so nothing is compared against it.
     Incomplete,
 }

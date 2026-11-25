@@ -57,6 +57,14 @@ cap-std = { version = "3", optional = true }
 cap-fs-ext = { version = "3", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Windows only, and only for `ns`: the non-panicking `Option` accessors for the by-handle file information (volume serial
+# number, file index, link count). `cap-fs-ext`'s `MetadataExt` exposes the same data through accessors that `expect()` it
+# and panic on metadata that did not come from an open handle (a directory entry's). The `Option` form lives in this
+# crate's `#[doc(hidden)]` `_WindowsByHandle` trait, which `cap-fs-ext` itself builds on. Already in the dependency tree
+# through `cap-std` (same 3.x release train); adding it here adds no new code, only a direct edge.
+cap-primitives = { version = "3", optional = true }
+
 [features]
 default = ["s3", "http", "ns"]
 # S3 / S3-compatible (Wasabi, B2, R2, MinIO) transport backend.
@@ -67,7 +75,7 @@ http = ["dep:reqwest"]
 # `--no-default-features --features ns` drops the cloud backends (`s3`, `http`: no aws, reqwest or hyper) but NOT the engine's local
 # dependencies (blake3, zstd, tokio, chrono, ...), which are still unconditional in this package. The `ns` code itself uses none of them
 # (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. DJ ruled 2026-11-23: ungated for now.
-ns = ["dep:cap-std", "dep:cap-fs-ext", "dep:unicode-normalization"]
+ns = ["dep:cap-std", "dep:cap-fs-ext", "dep:unicode-normalization", "dep:cap-primitives"]
 # Exposes `ns::conformance`, the suite a backend author runs against their own `Backend`. Needs `ns`.
 conformance = ["ns"]
 

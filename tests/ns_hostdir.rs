@@ -1081,6 +1081,90 @@ fn a_rename_onto_itself_is_refused_but_a_respelling_of_its_own_name_is_allowed()
     assert_eq!(f.dir.read(&p("/note.txt"), 10).unwrap().0, b"n");
 }
 
+/// Respelling an entry while moving it between two spellings of one directory. Whether `/Dir` and `/dir` are one
+/// directory or two depends on the volume, so the test asks the volume (a probe file, looked up under the other case) and
+/// checks the right answer for each: on a case-insensitive volume the rename is the entry's own respelling and must not
+/// be refused as a collision with itself; on a case-sensitive one `/dir` is a different directory, whose entries are
+/// real siblings that must still be protected.
+#[test]
+fn a_rename_between_two_spellings_of_a_directory_is_decided_by_the_directory_not_the_spelling() {
+    let f = fixture();
+    fs::create_dir(f.root.join("Dir")).unwrap();
+    fs::write(f.root.join("Dir/x"), b"mine").unwrap();
+    let case_insensitive = f.root.join("dir").exists();
+    let names_in = |dir: &str| -> Vec<String> {
+        f.dir
+            .walk(&p(dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    };
+
+    if case_insensitive {
+        // One directory under two spellings: `/Dir/x` becomes `/dir/X`, a respelling, allowed.
+        f.dir
+            .write(
+                &p("/Dir/x"),
+                WriteOp::RenameWithinMount { to: p("/dir/X") },
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(names_in("/Dir"), ["X"]);
+        assert_eq!(f.dir.read(&p("/Dir/X"), 10).unwrap().0, b"mine");
+        // It is still a rename onto an existing name when it really is one.
+        fs::write(f.root.join("Dir/y"), b"other").unwrap();
+        assert_eq!(
+            kind(f.dir.write(
+                &p("/Dir/y"),
+                WriteOp::RenameWithinMount { to: p("/dir/x") },
+                &[],
+                None
+            )),
+            NsErrorKind::CaseCollision
+        );
+        assert_eq!(f.dir.read(&p("/Dir/y"), 10).unwrap().0, b"other");
+    } else {
+        // Two directories. `/dir` has its own `x`: the move must not replace it, and a case-only difference from it is
+        // still a collision (the grammar is portable).
+        fs::create_dir(f.root.join("dir")).unwrap();
+        fs::write(f.root.join("dir/x"), b"theirs").unwrap();
+        assert_eq!(
+            kind(f.dir.write(
+                &p("/Dir/x"),
+                WriteOp::RenameWithinMount { to: p("/dir/x") },
+                &[],
+                None
+            )),
+            NsErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            kind(f.dir.write(
+                &p("/Dir/x"),
+                WriteOp::RenameWithinMount { to: p("/dir/X") },
+                &[],
+                None
+            )),
+            NsErrorKind::CaseCollision
+        );
+        assert_eq!(f.dir.read(&p("/dir/x"), 10).unwrap().0, b"theirs");
+        assert_eq!(f.dir.read(&p("/Dir/x"), 10).unwrap().0, b"mine");
+        // With nothing in the way, the move into the other directory works and keeps the new spelling.
+        fs::remove_file(f.root.join("dir/x")).unwrap();
+        f.dir
+            .write(
+                &p("/Dir/x"),
+                WriteOp::RenameWithinMount { to: p("/dir/X") },
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(names_in("/dir"), ["X"]);
+        assert!(names_in("/Dir").is_empty());
+    }
+}
+
 #[test]
 fn walk_is_sorted_by_utf8_bytes_on_a_real_directory() {
     let f = fixture();

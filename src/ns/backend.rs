@@ -197,6 +197,14 @@ impl Caps {
 }
 
 /// A mount's grant, enforced by the [`Namespace`](super::Namespace) on top of the backend's own [`Caps::writable`].
+///
+/// **The grant belongs to the mount, not to the data behind it.** `ReadOnly` means "nothing written *through this mount*
+/// changes anything"; it does not make the host directory read-only. If the embedder also mounts the same directory, or
+/// one inside it, read-write somewhere else, or another process writes it, what this mount reads changes. The Kit
+/// enforces the grant per mount and the embedder chooses the host directories, so choose them to be disjoint. The one
+/// overlap the Kit can see, the *same* directory mounted twice, is refused at `build()`
+/// (`InvalidInput(DuplicateRoot)`); a directory mounted together with one of its ancestors or descendants is not
+/// detected, because the Kit holds no host paths by design (see [`Backend::root_identity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Access {
@@ -212,9 +220,28 @@ pub enum Access {
 /// from the backing store goes through [`validate_name`](super::validate_name)), must refuse to create a name that
 /// case-folds to an existing sibling (`CaseCollision`), and must return `Unsupported` for anything their [`Caps`] say
 /// they cannot do. The [`conformance`](super::conformance) suite checks all of it.
+///
+/// **This trait is not frozen** (see the [module docs](super)). New methods arrive with a default body, so an existing
+/// implementation keeps compiling and behaves as if the new capability were absent; [`Backend::root_identity`] was added
+/// that way. A method without a default would be a breaking change and a minor bump while pre-1.0.
 pub trait Backend: Send + Sync {
     /// What this mount can do. Cheap; may be called often.
     fn caps(&self) -> Caps;
+
+    /// Which host directory this mount is rooted at, as `(device, inode)` (Windows: volume serial number and file
+    /// index), or `None` if the backend is not over a host directory or cannot tell. **Default `None`.**
+    ///
+    /// [`NamespaceBuilder::build`](super::NamespaceBuilder::build) uses it for one check: two mounts that report the
+    /// same identity are refused (`InvalidInput(DuplicateRoot)`), because access is enforced per mount and two mounts of
+    /// one directory would let a write through one change what the other, perhaps read-only, mount reads.
+    ///
+    /// What this does **not** detect: a directory mounted together with an ancestor or a descendant of it (it needs
+    /// host paths, which the Kit does not keep), two mounts of a backend that returns `None`, or an identity that
+    /// differs because the same directory was reached through two different hard-linked or bind-mounted views. Only a
+    /// backend over a real host directory should return `Some`; its value must not change for the life of the backend.
+    fn root_identity(&self) -> Option<(u64, u64)> {
+        None
+    }
 
     /// List a directory, **sorted by name in UTF-8 byte order** (so `B` sorts before `a`, and `z` before `é`), the whole
     /// directory at once. Only entries that are addressable are listed: names outside the grammar, temporary files, and

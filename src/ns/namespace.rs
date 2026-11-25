@@ -32,6 +32,15 @@
 //! - **`walk` is sorted by name in UTF-8 byte order**, and is not paged yet (a directory is returned whole). Paging is
 //!   deferred until a read-only content-addressed mount has exercised the trait; adding it will be additive.
 //!
+//! - **A grant is per mount, not per host directory.** `Access::ReadOnly` makes every write *through that mount* a
+//!   `PermissionDenied`; it does not make the directory behind it read-only. Mount `D` read-write at `/rw` and `D/locked`
+//!   read-only at `/ro`, and a write through `/rw` changes what `/ro` reads. The Kit cannot see that: it holds no host
+//!   paths. The embedder chooses the host directories, so the embedder must keep them disjoint (or accept the overlap).
+//!   The one overlap it does catch is the **same** directory mounted twice, whatever the grants: `build()` refuses two
+//!   mounts whose backends report the same [`Backend::root_identity`] (`InvalidInput(DuplicateRoot)`). A directory
+//!   mounted together with an **ancestor or descendant** of itself is **not** detected, and neither is a backend that
+//!   reports no identity (`Memory` reports none).
+//!
 //! What the Namespace does **not** do is decide *which* host directories may be mounted, or who may mount what. That is
 //! policy, and policy (and the resolver that turns a role like "this app's config directory" into a real directory) is the
 //! embedder's. The Kit confines to the roots it is handed.
@@ -76,14 +85,32 @@ impl NamespaceBuilder {
         self
     }
 
-    /// Finish. Refused: two mounts at the same (case-folded) path (`AlreadyExists`), and a `ReadOnly` mount nested under
-    /// a `ReadWrite` one (`InvalidInput(ReadOnlyUnderReadWrite)`).
+    /// Finish. Refused: two mounts at the same (case-folded) path (`AlreadyExists`), two mounts over the same host
+    /// directory (`InvalidInput(DuplicateRoot)`, from [`Backend::root_identity`]; the error names the later mount point),
+    /// and a `ReadOnly` mount nested under a `ReadWrite` one (`InvalidInput(ReadOnlyUnderReadWrite)`).
+    ///
+    /// Overlap of one host directory inside another (an ancestor and a descendant) is **not** detected; see the
+    /// [module docs](self).
     pub fn build(self) -> NsResult<Namespace> {
         for (i, m) in self.mounts.iter().enumerate() {
             for other in &self.mounts[..i] {
                 if other.key == m.key {
                     return Err(NsError::at(NsErrorKind::AlreadyExists, &m.point));
                 }
+            }
+        }
+        for (i, m) in self.mounts.iter().enumerate() {
+            let Some(id) = m.backend.root_identity() else {
+                continue;
+            };
+            if self.mounts[..i]
+                .iter()
+                .any(|other| other.backend.root_identity() == Some(id))
+            {
+                return Err(NsError::at(
+                    NsErrorKind::InvalidInput(InputReason::DuplicateRoot),
+                    &m.point,
+                ));
             }
         }
         for m in &self.mounts {
@@ -111,6 +138,12 @@ impl NamespaceBuilder {
 /// A mount table and the five verbs over it: `walk`, `read`, `stat` (the `manifest` verb), `write` and `watch`.
 ///
 /// Cheap to clone (the backends are shared).
+///
+/// **Grants are per mount, not per host directory.** A `ReadOnly` mount refuses writes made through it; it does not stop a
+/// `ReadWrite` mount (or another process) that reaches the same host files by another route. The embedder chooses the
+/// host directories and must keep them disjoint. `build()` refuses only the *same* directory mounted twice; an ancestor
+/// and a descendant mounted together are not detected, because the Kit holds no host paths. See the
+/// [module docs](self).
 #[derive(Clone)]
 pub struct Namespace {
     mounts: Vec<Mount>,

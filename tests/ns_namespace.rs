@@ -192,6 +192,108 @@ fn walk_is_sorted_by_name_in_utf8_byte_order_with_synthesised_names_merged() {
     assert_eq!(got, ["B", "Y", "a", "m", "z", "\u{e9}"]);
 }
 
+/// Two mounts over the same host directory are refused, whatever the grants and wherever they sit: a grant is per mount,
+/// so a write through one would change what the other (perhaps read-only) one reads.
+#[test]
+fn the_same_host_directory_mounted_twice_is_refused() {
+    use storage_kit::ns::HostDir;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path();
+    let one = Arc::new(HostDir::open_ambient(path).unwrap());
+    // The same Arc twice, and two independent opens of the same directory, are both "the same directory".
+    let again = Arc::new(HostDir::open_ambient(path).unwrap());
+    let from_handle = Arc::new(
+        HostDir::from_dir(
+            cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert!(one.root_identity().is_some());
+
+    for (a, b) in [
+        (Access::ReadWrite, Access::ReadOnly),
+        (Access::ReadOnly, Access::ReadWrite),
+        (Access::ReadWrite, Access::ReadWrite),
+        (Access::ReadOnly, Access::ReadOnly),
+    ] {
+        for second in [one.clone(), again.clone(), from_handle.clone()] {
+            let err = Namespace::builder()
+                .mount(p("/rw"), one.clone(), a)
+                .mount(p("/ro"), second, b)
+                .build()
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                NsErrorKind::InvalidInput(InputReason::DuplicateRoot),
+                "{a:?} then {b:?}"
+            );
+            assert_eq!(
+                err.path().map(NsPath::as_str),
+                Some("/ro"),
+                "names the later mount point"
+            );
+        }
+    }
+    // Not only siblings: a mount nested under another, or sharing a synthesised ancestor, is checked all the same.
+    let err = Namespace::builder()
+        .mount(p("/a/x"), one.clone(), Access::ReadOnly)
+        .mount(p("/b/y"), again.clone(), Access::ReadOnly)
+        .build()
+        .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        NsErrorKind::InvalidInput(InputReason::DuplicateRoot)
+    );
+    assert!(format!("{err}").contains("same host directory"), "{err}");
+}
+
+#[test]
+fn different_host_directories_and_memory_mounts_build() {
+    use storage_kit::ns::HostDir;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("one")).unwrap();
+    std::fs::create_dir(tmp.path().join("two")).unwrap();
+    let one = Arc::new(HostDir::open_ambient(tmp.path().join("one")).unwrap());
+    let two = Arc::new(HostDir::open_ambient(tmp.path().join("two")).unwrap());
+    assert_ne!(one.root_identity(), two.root_identity());
+    let m = mem();
+    // `Memory` reports no identity (it has no host directory), so the same `Memory` twice is not what this check is for.
+    assert_eq!(m.root_identity(), None);
+    let ns = Namespace::builder()
+        .mount(p("/one"), one, Access::ReadWrite)
+        .mount(p("/two"), two, Access::ReadOnly)
+        .mount(p("/m1"), m.clone(), Access::ReadWrite)
+        .mount(p("/m2"), m, Access::ReadOnly)
+        .build();
+    assert!(ns.is_ok(), "{:?}", ns.err());
+}
+
+/// What the Kit does NOT see, pinned so the documentation stays true: it holds no host paths, so a directory mounted
+/// together with one of its descendants is not detected, and a write through the writable mount shows through the
+/// read-only one. The embedder chooses the host directories and must keep them disjoint.
+#[test]
+fn an_ancestor_and_a_descendant_mounted_together_are_not_detected() {
+    use storage_kit::ns::HostDir;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("locked")).unwrap();
+    std::fs::write(tmp.path().join("locked/cfg"), b"original").unwrap();
+    let outer = Arc::new(HostDir::open_ambient(tmp.path()).unwrap());
+    let inner = Arc::new(HostDir::open_ambient(tmp.path().join("locked")).unwrap());
+    assert_ne!(outer.root_identity(), inner.root_identity());
+    let ns = Namespace::builder()
+        .mount(p("/rw"), outer, Access::ReadWrite)
+        .mount(p("/ro"), inner, Access::ReadOnly)
+        .build()
+        .expect("an ancestor and a descendant are not detected (documented)");
+    assert_eq!(
+        kind(ns.write(&p("/ro/cfg"), WriteOp::Replace, b"x", None)),
+        NsErrorKind::PermissionDenied
+    );
+    ns.write(&p("/rw/locked/cfg"), WriteOp::Replace, b"changed", None)
+        .unwrap();
+    assert_eq!(ns.read(&p("/ro/cfg"), 100).unwrap().0, b"changed");
+}
+
 #[test]
 fn a_read_only_mount_nested_under_a_read_write_one_is_refused() {
     // The attack: /data is writable, /data/a/locked is meant to be read-only. Through the writable parent one renames
@@ -235,7 +337,8 @@ fn a_read_only_mount_nested_under_a_read_write_one_is_refused() {
         .mount(p("/ro/scratch"), mem(), Access::ReadWrite)
         .build()
         .unwrap();
-    // The protected directory is only reachable through the read-only mount.
+    // Writes through the read-only mount are refused. (The protected directory is NOT unreachable: `/data/a/locked` is the
+    // same host directory. The Kit enforces the grant per mount and does not see that overlap; see the test below.)
     assert_eq!(
         kind(ns.write(&p("/ro/cfg"), WriteOp::Replace, b"x", None)),
         NsErrorKind::PermissionDenied
