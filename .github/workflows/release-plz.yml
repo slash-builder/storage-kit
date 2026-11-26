@@ -4,7 +4,9 @@
 #                     checked by cargo-semver-checks). Merging that PR is the deliberate act. This job has no publish credentials.
 #                 ->  plan: is the version in Cargo.toml missing from crates.io? (read-only)
 #                 ->  verify: build, test and dry-run the package with NO publish credentials (only when a release is due).
-#                 ->  publish: in the protected `release` environment (reviewer approves). The only job with the OIDC token, and it
+#                 ->  publish: in the `release` environment, which is meant to require a reviewer's approval (that is a repository
+#                     setting, NOT enforced by this file: check Settings > Environments > release before merging a release PR).
+#                     The only job with the OIDC token, and it
 #                     installs and compiles nothing (`cargo publish --no-verify` of the commit `verify` just checked): no third-party
 #                     binary and no dependency build script ever runs while the token exists. Then it tags vX.Y.Z and creates the
 #                     GitHub release.
@@ -73,7 +75,7 @@ jobs:
     concurrency:
       group: release-plz-publish
       cancel-in-progress: false
-    environment: release            # required reviewers; also the environment name registered as the trusted publisher
+    environment: release            # intended: required reviewers (a repo setting, not enforced here); also the name registered as the trusted publisher
     permissions:
       contents: write               # create the tag and the GitHub release
       id-token: write               # OIDC token that crates.io exchanges for a short-lived publish token

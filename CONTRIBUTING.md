@@ -70,6 +70,8 @@ version, a hygiene check, and a DCO check.
 
 Releases are automated with [release-plz](https://release-plz.dev): pushes to `main` open or update a release pull request that bumps the version and changelog from Conventional Commit titles (`feat:`, `fix:`, a `!` for a breaking change) and checks the bump with `cargo-semver-checks`. Merging that pull request releases the crate: a tag `vX.Y.Z` equal to the crate version, published to crates.io by trusted publishing from a protected environment.
 
+Do not hand-write entries under `## [Unreleased]` in `CHANGELOG.md`: release-plz writes the entry for each release from the commit titles (the pull request title, with a squash merge) and keeps whatever is already under `[Unreleased]` as well, so a hand-written entry appears twice in the release pull request. Put the detail in the code docs or the README, and write the title as the changelog line. A section for an already-released version (such as `0.2.0`) is ordinary text and can be edited.
+
 ## Pull request process
 
 1. Fork the repository and create a branch from `main`.

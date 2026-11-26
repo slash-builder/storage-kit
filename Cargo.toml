@@ -74,10 +74,14 @@ http = ["dep:reqwest"]
 # The namespace layer: one path-addressed tree over mounted backends (`HostDir`, `Memory`), with a polling watcher.
 # `--no-default-features --features ns` drops the cloud backends (`s3`, `http`: no aws, reqwest or hyper) but NOT the engine's local
 # dependencies (blake3, zstd, tokio, chrono, ...), which are still unconditional in this package. The `ns` code itself uses none of them
-# (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. DJ ruled 2026-11-23: ungated for now.
+# (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. Decision of 2026-11-23: ungated for now.
 ns = ["dep:cap-std", "dep:cap-fs-ext", "dep:unicode-normalization", "dep:cap-primitives"]
 # Exposes `ns::conformance`, the suite a backend author runs against their own `Backend`. Needs `ns`.
 conformance = ["ns"]
+
+# docs.rs builds the default features only; the intra-doc links to `ns::conformance` need the feature that compiles it.
+[package.metadata.docs.rs]
+features = ["conformance"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
