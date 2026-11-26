@@ -49,7 +49,7 @@ frozen.
 | not yet released | 4 | Key-and-encryption seam (in design); would be `0.3.0` |
 
 The minimum supported Rust version (MSRV) is **1.88**. Raising it is a
-minor-version change, noted in `CHANGELOG.md`.
+minor-version change, noted in the commit title, which release-plz turns into the `CHANGELOG.md` entry.
 
 ## Quick start
 
@@ -175,11 +175,11 @@ slashbuilder-storage-kit = { version = "0.2", default-features = false, features
 - `http` (default-on) — pulls in `reqwest` and compiles
   `backend::HttpBackend`.
 - `ns` (default-on) — the [namespace layer](#namespace-layer-ns), which adds
-  `cap-std`, `cap-fs-ext` and `unicode-normalization`.
+  `cap-std`, `cap-fs-ext` and `unicode-normalization` (plus `cap-primitives` on Windows).
 - `conformance` — exposes `ns::conformance`, the suite a backend author runs.
 
 `default = ["s3", "http", "ns"]`, so existing consumers see no change with no
-action beyond the new `ns` module: 3 direct crates (`cap-std`, `cap-fs-ext`, `unicode-normalization`) and about 11 added
+action beyond the new `ns` module: 3 direct crates (`cap-std`, `cap-fs-ext`, `unicode-normalization`; 4 on Windows with `cap-primitives`) and about 11 added
 packages in the lockfile, none of them network or async crates (opt out with `default-features = false`). A local-only consumer (no cloud transport, `PartitionStore` /
 `LocalBackend` only) can build with `default-features = false` to link
 neither cloud SDK. `LocalBackend` itself is always compiled — it has no
@@ -200,9 +200,10 @@ content-addressed engine above (a test checks the source).
   refuses writes made through that mount, not writes to the same directory by another mount that
   overlaps it or by another process (see `ns::Namespace` for the overlap rules).
 - **`HostDir`**: a mount over an OS directory, confined with `cap-std`: no `..`, no
-  symlink or reparse point followed, only regular files and directories, no *writes* to
-  multiply-linked files (a *read* of one is served; `stat` reports the link count),
-  atomic `Replace` (temp file, fsync, rename, fsync dir).
+  symlink or reparse point followed, only regular files and directories, `Replace` refuses
+  a multiply-linked file (`Remove` and `RenameWithinMount` act on the name; no operation
+  writes into an existing file; a *read* of a hard-linked file is served, and `stat` reports
+  the link count), atomic `Replace` (temp file, fsync, rename, fsync dir).
   **Linux and macOS** are the targets; **Windows** compiles but is weaker and says so
   (`Caps::strict_confinement` is `false`; see `ns::hostdir` for the list).
 - **`Memory`**: an in-memory mount with exact versions, for tests and scratch.

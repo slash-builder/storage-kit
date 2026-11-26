@@ -47,13 +47,15 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false, optional = true }
 bytes = { version = "1", optional = true }
 
-# The namespace layer (`storage_kit::ns`) is deliberately independent of the engine above: it uses only std, these two
-# crates and its own error type. `cap-std` confines `HostDir` to the directory handle it was opened on (no `..`, no
-# symlink escape, no ambient path lookups); `unicode-normalization` is how the portable name grammar checks NFC.
+# The namespace layer (`storage_kit::ns`) is deliberately independent of the engine above: it uses only std, the four
+# crates below (`cap-std`, `cap-fs-ext`, `cap-primitives` on Windows, `unicode-normalization`) and its own error type.
+# `cap-std` confines `HostDir` to the directory handle it was opened on (no `..`, no symlink escape, no ambient path
+# lookups); `unicode-normalization` is how the portable name grammar checks NFC.
 cap-std = { version = "3", optional = true }
-# Same project and release train as `cap-std` (3.x). It supplies the two open flags `cap-std` itself keeps private: do
-# not follow a final symlink, and do not block on a FIFO. Without it the "refuse any symlink" rule would be a lstat-then-
-# open check instead of one atomic open.
+# Same project and release train as `cap-std` (3.x). It supplies the open flag `cap-std` itself keeps private: do not
+# follow a final symlink. Without it the "refuse any symlink" rule would be a lstat-then-open check instead of one atomic
+# open. (The do-not-block-on-a-FIFO flag is not from here: it is a hand-written `O_NONBLOCK` constant in `hostdir.rs`,
+# passed through `cap-std`'s `custom_flags`, because the crate takes no `libc` dependency.)
 cap-fs-ext = { version = "3", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 

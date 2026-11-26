@@ -40,7 +40,7 @@
 //! **The root re-export block below *is* the frozen surface.** Names, signatures,
 //! field shapes, trait method sets, and enum variants are all locked;
 //! breaking any of them requires a design decision, not a patch, and
-//! (this crate is pre-1.0) bumps the **minor** version; see `CHANGELOG.md`.
+//! (this crate is pre-1.0) bumps the **minor** version (the commit title says so, and release-plz carries it into `CHANGELOG.md`).
 //!
 //! Three rules make "frozen" mean one unambiguous thing:
 //!

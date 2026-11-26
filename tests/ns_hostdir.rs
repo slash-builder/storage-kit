@@ -541,6 +541,45 @@ fn a_hard_linked_file_is_served_on_read_and_stat_reports_the_links() {
     assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
 }
 
+/// What "refuses" means for a hard-linked file, pinned: `Replace` is refused, but `Remove` and `RenameWithinMount` act on
+/// the NAME and are allowed, and none of them changes the contents of the file as reached through its other name. The
+/// module docs say exactly this.
+#[cfg(unix)]
+#[test]
+fn remove_and_rename_of_a_hard_linked_file_are_allowed_and_leave_the_other_name_intact() {
+    let f = fixture();
+    // A link to a file outside the root, and a link between two names inside it.
+    fs::hard_link(f.outside.join("secret.txt"), f.root.join("alias")).unwrap();
+    fs::write(f.root.join("a"), b"shared").unwrap();
+    fs::hard_link(f.root.join("a"), f.root.join("b")).unwrap();
+
+    assert_eq!(
+        kind(f.dir.write(&p("/alias"), WriteOp::Replace, b"x", None)),
+        NsErrorKind::HardLinked
+    );
+    // Rename acts on the name.
+    f.dir
+        .write(
+            &p("/alias"),
+            WriteOp::RenameWithinMount { to: p("/moved") },
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(fs::symlink_metadata(f.root.join("alias")).is_err());
+    assert_eq!(fs::read(f.root.join("moved")).unwrap(), OUTSIDE);
+    assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
+    // Remove acts on the name, too: the other name keeps its contents.
+    f.dir
+        .write(&p("/moved"), WriteOp::Remove, &[], None)
+        .unwrap();
+    assert!(fs::symlink_metadata(f.root.join("moved")).is_err());
+    assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
+    f.dir.write(&p("/a"), WriteOp::Remove, &[], None).unwrap();
+    assert_eq!(fs::read(f.root.join("b")).unwrap(), b"shared");
+    assert_eq!(f.dir.stat(&p("/b")).unwrap().links, Some(1));
+}
+
 #[cfg(unix)]
 fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo")
