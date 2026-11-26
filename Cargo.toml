@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # The content-addressing, fragmentation and packfile engine. This crate does not depend on bitchain; bitchain depends on
 # this crate.
 blake3 = "1"
-fastcdc = "3"
+fastcdc = "4"
 zstd = "0.14"
 memmap2 = "0.9"
 hex = "0.4"
