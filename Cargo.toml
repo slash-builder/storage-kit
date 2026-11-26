@@ -47,13 +47,15 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false, optional = true }
 bytes = { version = "1", optional = true }
 
-# The namespace layer (`storage_kit::ns`) is deliberately independent of the engine above: it uses only std, these two
-# crates and its own error type. `cap-std` confines `HostDir` to the directory handle it was opened on (no `..`, no
-# symlink escape, no ambient path lookups); `unicode-normalization` is how the portable name grammar checks NFC.
+# The namespace layer (`storage_kit::ns`) is deliberately independent of the engine above: it uses only std, the four
+# crates below (`cap-std`, `cap-fs-ext`, `cap-primitives` on Windows, `unicode-normalization`) and its own error type.
+# `cap-std` confines `HostDir` to the directory handle it was opened on (no `..`, no symlink escape, no ambient path
+# lookups); `unicode-normalization` is how the portable name grammar checks NFC.
 cap-std = { version = "3", optional = true }
-# Same project and release train as `cap-std` (3.x). It supplies the two open flags `cap-std` itself keeps private: do
-# not follow a final symlink, and do not block on a FIFO. Without it the "refuse any symlink" rule would be a lstat-then-
-# open check instead of one atomic open.
+# Same project and release train as `cap-std` (3.x). It supplies the open flag `cap-std` itself keeps private: do not
+# follow a final symlink. Without it the "refuse any symlink" rule would be a lstat-then-open check instead of one atomic
+# open. (The do-not-block-on-a-FIFO flag is not from here: it is a hand-written `O_NONBLOCK` constant in `hostdir.rs`,
+# passed through `cap-std`'s `custom_flags`, because the crate takes no `libc` dependency.)
 cap-fs-ext = { version = "3", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 
@@ -74,10 +76,14 @@ http = ["dep:reqwest"]
 # The namespace layer: one path-addressed tree over mounted backends (`HostDir`, `Memory`), with a polling watcher.
 # `--no-default-features --features ns` drops the cloud backends (`s3`, `http`: no aws, reqwest or hyper) but NOT the engine's local
 # dependencies (blake3, zstd, tokio, chrono, ...), which are still unconditional in this package. The `ns` code itself uses none of them
-# (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. DJ ruled 2026-11-23: ungated for now.
+# (`tests/ns_independence.rs` enforces that), so gating them behind a `cas` feature later is mechanical. Decision of 2026-11-23: ungated for now.
 ns = ["dep:cap-std", "dep:cap-fs-ext", "dep:unicode-normalization", "dep:cap-primitives"]
 # Exposes `ns::conformance`, the suite a backend author runs against their own `Backend`. Needs `ns`.
 conformance = ["ns"]
+
+# docs.rs builds the default features only; the intra-doc links to `ns::conformance` need the feature that compiles it.
+[package.metadata.docs.rs]
+features = ["conformance"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
