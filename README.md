@@ -45,6 +45,7 @@ frozen.
 |---|---|---|
 | `0.1.x` | 2 | The format-v2 engine (BLAKE3, FastCDC, Zstd packfiles, recursive fragmentation) |
 | `0.2.0` | 3 | Format v3: `Context`/`Address` retired, `create`/`open` split, partition record |
+| `0.2.1` | 3 | Adds the `ns` namespace layer (independent of the engine; format unchanged) |
 | not yet released | 4 | Key-and-encryption seam (in design); would be `0.3.0` |
 
 The minimum supported Rust version (MSRV) is **1.88**. Raising it is a
@@ -195,10 +196,13 @@ cloud dependency.
 content-addressed engine above (a test checks the source).
 
 - **`Namespace`**: a mount table; longest prefix wins, mounts nest, mount ancestors are
-  listed, `ReadOnly` is enforced, a rename across mounts is `CrossMount`.
+  listed, a rename across mounts is `CrossMount`, and `ReadOnly` is enforced **per mount**: it
+  refuses writes made through that mount, not writes to the same directory by another mount that
+  overlaps it or by another process (see `ns::Namespace` for the overlap rules).
 - **`HostDir`**: a mount over an OS directory, confined with `cap-std`: no `..`, no
-  symlink or reparse point followed, only regular files and directories, no writes to
-  multiply-linked files, atomic `Replace` (temp file, fsync, rename, fsync dir).
+  symlink or reparse point followed, only regular files and directories, no *writes* to
+  multiply-linked files (a *read* of one is served; `stat` reports the link count),
+  atomic `Replace` (temp file, fsync, rename, fsync dir).
   **Linux and macOS** are the targets; **Windows** compiles but is weaker and says so
   (`Caps::strict_confinement` is `false`; see `ns::hostdir` for the list).
 - **`Memory`**: an in-memory mount with exact versions, for tests and scratch.

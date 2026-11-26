@@ -7,7 +7,7 @@
 //! `openat`-style calls that do **not** follow a final symlink (`O_NOFOLLOW`), and `cap-std` independently refuses any
 //! resolution that would leave the root. The host path of the root is never stored, so it cannot be echoed back.
 //!
-//! What that gives, on **Linux and macOS** (tested on Linux; macOS is compile-checked only so far):
+//! What that gives, on **Linux and macOS** (both run the test suite in CI):
 //!
 //! - **No symlink is followed, anywhere on the way.** A symlink met as an intermediate directory or as the final entry
 //!   is refused with `Escapes`, whether it points outside the root or inside it. The check is the atomic `open`
@@ -15,11 +15,15 @@
 //!   the worst outcome is an error. (`lstat` is used only afterwards, to choose the *error kind*.)
 //! - **Only regular files and directories are ever opened.** A FIFO, socket or device is classified with `lstat`
 //!   first and never opened (opening a FIFO can block forever); the open itself is also non-blocking, and the opened
-//!   handle's `fstat` is checked again. A hostile swap to a FIFO between the two steps cannot hang a read.
+//!   handle's `fstat` is checked again. Where the non-blocking flag is known (Linux on x86, x86-64, arm, aarch64,
+//!   riscv, loongarch64, s390x and powerpc, and macOS, iOS and the BSDs), a hostile swap to a FIFO between the two steps
+//!   cannot hang a read. On any other Unix target the flag is 0 and such a swap can hang that one read (it is a
+//!   denial of service of one call, not a confinement problem).
 //! - **A write to a file with more than one hard link is refused** (`HardLinked`), as is a `Replace` of one. Today
 //!   this is a *belt*: `Replace` renames a new file over the name, so another name for the same inode keeps the old
 //!   content either way. The guard is kept for the day an in-place write (`append`, `at_offset`) exists, when it
-//!   becomes the thing that stops a write through one name from changing a file reachable by another.
+//!   becomes the thing that stops a write through one name from changing a file reachable by another. **Reads are not
+//!   refused**: a file with more than one link is read like any other (see "What it does not guarantee" below).
 //! - **Names are checked against the portable grammar** and creating a name that case-folds to an existing sibling is
 //!   refused (`CaseCollision`) even on a case-sensitive volume. The decision is made on a **listing of the directory**,
 //!   comparing the names as stored: an exact match is `AlreadyExists`, a match that differs only by case or by Unicode
@@ -37,16 +41,23 @@
 //!   canonical path.
 //! - **Version checks are best effort.** `if_version` on `HostDir` is check-then-act ([`Caps::exact_if_version`] is
 //!   `false`): another process can change the file between the check and the rename. A stale version is caught when
-//!   the change happened before the check; a change *during* the window is not.
+//!   the change happened before the check; a change *during* the window is not. A version is the file's mtime, size,
+//!   inode (file index on Windows) and device, so it also misses an edit **in place that keeps the size and lands in the
+//!   same timestamp tick as the previous write**, on every platform (the tick is the clock granularity of the kernel and
+//!   filesystem: coarse on Windows, on the order of 10 ms; it can also be several milliseconds on Unix). A replaced
+//!   file (a new inode) is told apart; an in-place rewrite of the same length right after the last write may not be.
+//!   Do not build on a version to detect a same-size, same-instant edit.
 //! - **`RenameWithinMount`'s "destination must not exist"** is likewise a check followed by a rename, and the rename
 //!   replaces a destination that appeared in the window.
 //! - **Rights of whoever else can write the directory.** A process that can already write inside the root can cause
 //!   `Io` errors and denial of service (for example by filling the disk), and can race the best-effort checks above.
-//!   It cannot make the namespace read or write outside the root. It *can* (it is the same user, or has write access)
+//!   It cannot make the Kit *write* outside the root, and no path or symlink it creates lets a read leave the root. It
+//!   *can* hard-link a file from elsewhere on the same filesystem into the root (see the hard-link bullet below), and
+//!   the namespace then serves that file's contents on a read. It *can* (it is the same user, or has write access)
 //!   rename or replace a directory, including one the Kit holds a handle to or one a mount point hangs from, so what a
 //!   path names can change between two calls, and a rename of the mount's own root directory by someone outside the
-//!   Kit leaves the held handle pointing at the moved directory. That gives them nothing they did not already have, but
-//!   the Kit does not defend against it: confinement is "never outside the handle it holds", not "the directory stays
+//!   Kit leaves the held handle pointing at the moved directory. The renames give them nothing they did not already have,
+//!   but the Kit does not defend against them: confinement is "never outside the handle it holds", not "the directory stays
 //!   where it was".
 //! - **Polling watch** sees a change only on the poll after it happens, and fingerprints `(name, kind, len, mtime,
 //!   inode)`: two in-place writes of the same length inside one filesystem timestamp tick can be missed. A watched
@@ -57,7 +68,16 @@
 //!   plus one (default 64) however wide the tree is. A tree deeper than that is an incomplete scan, handled like
 //!   `max_tracked`: refused at the start, one `rescan` if it grows past it. A scan that cannot finish (depth, entries,
 //!   descriptors, I/O error) is reported as one `rescan`, not compared as a partial picture.
-//! - **Hard-link and alias writes through other names** are only caught by the link count at the moment of the call.
+//! - **Hard links are refused on write, not on read.** A write checks the link count of the file it would change and
+//!   refuses if it is above 1, but only at the moment of the call. `read` and `stat` do **not** refuse a file with more
+//!   than one link. A process that can write inside the root can hard-link a file from elsewhere on the same filesystem
+//!   into it, and a read through the namespace then returns that file's contents. No `..`, symlink or other path
+//!   leaves the root, so this is not a path escape; but it is not confinement of the *data*. Whether the linking
+//!   process needs read access to the target depends on the OS: Linux restricts it when `fs.protected_hardlinks` is on
+//!   (the default on most distributions), macOS has no such protection. Where it is not restricted, a less-privileged
+//!   writer of the directory can make the Kit, running with more privilege, serve a file that user could not read
+//!   itself. An embedder that cares should check [`Stat::links`](super::Stat::links) before reading (more than 1 is
+//!   untrusted), or not mount a directory that less-privileged users can write.
 //! - **Access is the mount's, not the directory's.** `HostDir` itself is always writable; whether a mount may write is
 //!   the grant the [`Namespace`](super::Namespace) holds ([`Access`](super::Access)), enforced per mount. Two mounts
 //!   over directories that overlap share files: a write through a `ReadWrite` mount of `D` changes what a `ReadOnly`

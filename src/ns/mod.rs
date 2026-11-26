@@ -10,7 +10,8 @@
 //! against it, because a trait shaped by two simple backends can bend when a third arrives.
 //!
 //! **This layer is independent of the content-addressed engine in the rest of this crate.** It uses only `std`,
-//! `cap-std`, `unicode-normalization` and its own [`NsError`]; none of the engine's types or dependencies appear in it
+//! `cap-std` (with its companions `cap-fs-ext`, and `cap-primitives` on Windows), `unicode-normalization` and its own
+//! [`NsError`]; none of the engine's types or dependencies appear in it
 //! (a test checks the source). It is built by the `ns` feature.
 //!
 //! The design in brief:
@@ -26,9 +27,11 @@
 //! - **`write` has a closed set of ops** ([`WriteOp`]): `CreateExclusive`, `Replace` (atomic), `Remove`,
 //!   `RenameWithinMount`, `MakeDir`. These are arguments to `write`, not new verbs. `append` and `at_offset` are
 //!   reserved.
-//! - **Confinement is the Kit's; policy is the embedder's.** The Kit refuses `..`, symlinks, reparse points, devices and
-//!   multiply-linked files inside the root it is given. It has no notion of which host directories *may* be mounted, or by
-//!   whom: the embedder supplies the resolver and the grants.
+//! - **Confinement is the Kit's; policy is the embedder's.** The Kit refuses `..`, symlinks, reparse points and devices
+//!   inside the root it is given, and refuses *writes* to a file with more than one hard link. It does **not** refuse to
+//!   *read* one: a hard link to a file elsewhere on the same filesystem, made by anyone who can write the directory, is
+//!   served like any other file ([`Stat::links`] reports the link count, for an embedder that wants to check). It has no
+//!   notion of which host directories *may* be mounted, or by whom: the embedder supplies the resolver and the grants.
 //! - **Watching** is a hint to re-read ([`Watch`], [`WatchBatch`]): a polling source in the Kit (std only), batches
 //!   numbered by `(epoch, generation)` so a gap *is* a rescan, namespace paths only.
 //! - **Errors never carry a host path** ([`NsError`]).

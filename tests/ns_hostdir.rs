@@ -487,6 +487,60 @@ fn a_hard_linked_file_is_refused_on_write() {
     assert_eq!(fs::read(f.root.join("a")).unwrap(), b"new");
 }
 
+/// The documented limit of a best-effort version (see the `hostdir` module docs): the version is mtime, size and file
+/// identity, so an in-place edit that keeps the size AND the mtime is not told apart. A real edit only gets there by
+/// landing in the same timestamp tick as the previous write; the test sets the mtime back by hand so it is deterministic
+/// on every platform instead of depending on the clock.
+#[test]
+fn an_in_place_edit_with_the_same_size_and_mtime_is_not_detected() {
+    let f = fixture();
+    let path = f.root.join("f");
+    fs::write(&path, b"0123456789").unwrap();
+    let before = f.dir.stat(&p("/f")).unwrap();
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, b"abcdefghij").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(
+        f.dir.stat(&p("/f")).unwrap().version,
+        before.version,
+        "same size, same mtime, same file: the version cannot tell"
+    );
+    f.dir
+        .write(&p("/f"), WriteOp::Replace, b"new", Some(&before.version))
+        .unwrap();
+    // A change of size is always seen.
+    let v = f.dir.stat(&p("/f")).unwrap().version;
+    fs::write(&path, b"longer than before").unwrap();
+    assert_eq!(
+        kind(f.dir.write(&p("/f"), WriteOp::Replace, b"x", Some(&v))),
+        NsErrorKind::VersionMismatch
+    );
+}
+
+/// `read` does not refuse a file with more than one hard link (only writes do), and `stat` reports the count so an
+/// embedder can. The module docs say exactly this; this test is what keeps them honest. A hard link from outside the
+/// root is served. If a later release decides to refuse such reads, this test changes with that decision.
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_file_is_served_on_read_and_stat_reports_the_links() {
+    let f = fixture();
+    fs::hard_link(f.outside.join("secret.txt"), f.root.join("alias")).unwrap();
+    let (bytes, _) = f.dir.read(&p("/alias"), 100).unwrap();
+    assert_eq!(bytes, OUTSIDE);
+    assert_eq!(f.dir.stat(&p("/alias")).unwrap().links, Some(2));
+    // The write side of the same file is still refused.
+    assert_eq!(
+        kind(f.dir.write(&p("/alias"), WriteOp::Replace, b"x", None)),
+        NsErrorKind::HardLinked
+    );
+    assert_eq!(fs::read(f.outside.join("secret.txt")).unwrap(), OUTSIDE);
+}
+
 #[cfg(unix)]
 fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo")
@@ -750,7 +804,10 @@ fn no_host_path_appears_in_any_error() {
         mkfifo(&f.root.join("pipe"));
     }
     let stale = f.dir.stat(&p("/file")).unwrap().version;
-    fs::write(f.root.join("file"), b"changed!!!").unwrap();
+    // A DIFFERENT length, on purpose: a same-length rewrite of the same file right after the stat can land in the same
+    // timestamp tick and leave the version unchanged (a documented limit, and exactly how this test once failed on the
+    // Windows runner). The size is part of the version, so this change is seen on every platform.
+    fs::write(f.root.join("file"), b"changed, and longer").unwrap();
 
     let mut errors = vec![
         f.dir.read(&p("/missing"), 10).unwrap_err(),
